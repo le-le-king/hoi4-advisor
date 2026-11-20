@@ -248,6 +248,9 @@ class LiveError(RuntimeError):
 # 通行权判定缓存多久失效。省界一分钟内基本不变，但也不能隔夜复用。
 PASS_TTL = 60.0
 
+# 坐标索引的"还没加载过"哨兵（None 表示加载过了但没拿到）
+_NEED_LOAD = object()
+
 
 def _heap(addr: int) -> bool:
     return HEAP_LO < addr < HEAP_HI and addr % 8 == 0
@@ -319,6 +322,8 @@ class LiveGame:
         # 通行权判定缓存（省 -> 是不是我控制的），key 是 (pid, base, 我的国家序号)
         self._pass_cache: tuple[float, dict[int, bool]] = (0.0, {})
         self._pass_key: tuple = ()
+        # 省质心坐标索引（进攻线要按"方向"推进，判前后得用真实坐标）
+        self._xy_index = _NEED_LOAD
         self._army_countries_cache: tuple[float, int, int, dict] = (0.0, 0, 0, {})
         self._control_map_cache: tuple[float, int, int, dict] = (0.0, 0, 0, {})
         self._control_scan_failures = 0
@@ -2031,6 +2036,23 @@ class LiveGame:
                     break
         return sorted(out)
 
+    def _xy(self, prov: int):
+        """省的质心坐标（来自资料库）。拿不到返回 None——不影响别的判断。"""
+        idx = getattr(self, "_xy_index", None)
+        if idx is _NEED_LOAD:
+            try:
+                from . import prov_index as pi_mod
+                idx = pi_mod.load()
+            except Exception:  # noqa: BLE001
+                idx = None
+            self._xy_index = idx
+        if idx is None:
+            return None
+        try:
+            return idx.px(int(prov))
+        except Exception:  # noqa: BLE001
+            return None
+
     def distances_to(self, objective: int) -> dict[int, int]:
         """从 objective 出发，按陆地邻接做一遍 BFS，返回 省 → 跳数。
 
@@ -2107,6 +2129,37 @@ class LiveGame:
         dist = self.distances_to(objective)
         adj = self.adjacency()
         BIG = 1 << 30
+
+        # ── 战线朝向（0.11.2）──────────────────────────────
+        # 用**真实坐标**算"从我们前线重心指向目标"的单位向量，然后每一格挑
+        # "沿这个方向最靠前"的敌邻去打 —— 这样整条线是**平移**过去的。
+        #
+        # 为什么不能用跳数判前后（0.11.0 的写法）：跳数只能回答"哪个邻省离目标更近"，
+        # 真实地图上 25 个前线省里只有 9 个省有"更近的敌人"，其余 16 个侧翼
+        # 一个都推不动，战线越推越窄成楔形——就又变回用户否掉的形状了
+        # （`_probe/_p188` 实测）。
+        front_pts = [q for q in (self._xy(p) for p in holders) if q]
+        direction: tuple[float, float] | None = None
+        if front_pts:
+            cx = sum(q[0] for q in front_pts) / len(front_pts)
+            cy = sum(q[1] for q in front_pts) / len(front_pts)
+            op = self._xy(objective)
+            if op:
+                vx, vy = float(op[0]) - cx, float(op[1]) - cy
+                n = (vx * vx + vy * vy) ** 0.5
+                if n > 1e-6:
+                    direction = (vx / n, vy / n)
+
+        def _proj(f: int, n: int):
+            """从 f 走到 n，在朝目标方向上推进了多少（正=朝前）。"""
+            if direction is None:
+                return None
+            pf, pn = self._xy(f), self._xy(n)
+            if not pf or not pn:
+                return None
+            return ((pn[0] - pf[0]) * direction[0]
+                    + (pn[1] - pf[1]) * direction[1])
+
         attacks: list[tuple[int, int]] = []
         moves: list[tuple[int, int]] = []
         thin: list[int] = []
@@ -2121,22 +2174,41 @@ class LiveGame:
                     # 只有一个师：抽走这一格就空了。整条线是"抽得出人才推"
                     thin.append(f)
                     continue
-                best = min(incoming, key=lambda n: dist.get(n, BIG))
-                if dist.get(best, BIG) <= d_f:
+                best = None
+                if direction is not None:
+                    scored = [(_proj(f, n), n) for n in incoming]
+                    scored = [(s, n) for s, n in scored if s is not None]
+                    if scored:
+                        s_best, n_best = max(scored)
+                        if s_best > 0:
+                            best = n_best
+                if best is None:
+                    # 朝目标那一侧没有敌邻（比如被包围、或者这条线已经越过目标）：
+                    # 退回"离目标最近、且不比自己更远"，再不行就守着。
+                    cand = min(incoming, key=lambda n: dist.get(n, BIG))
+                    if dist.get(cand, BIG) <= d_f:
+                        best = cand
+                if best is not None:
                     attacks.append((f, best))
                     continue
-            # 跟前没有更近的敌省：这一格已经压过去了，让它**整个跟上去**。
+            # 跟前没有敌邻：这一格已经压过去了，让它**整个跟上去**。
             # 后方省已经不再挨着敌人，不需要留驻军——留 1 个的话每推一格就
             # 啃掉一个师，两格之后整条线就没兵了（离线验证 _p185 实测到）。
             fwd = [int(m) for m in (adj.get(f) or ())
-                   if int(m) in ours and dist.get(int(m), BIG) < d_f
+                   if int(m) in ours
                    and any(int(nb) not in ours for nb in (adj.get(int(m)) or ()))]
             if fwd and addrs:
-                moves.append((f, min(fwd, key=lambda m: dist.get(m, BIG))))
+                if direction is not None:
+                    # 往"更靠前"的那一格跟
+                    fwd.sort(key=lambda m: -(_proj(f, m) or -BIG))
+                else:
+                    fwd.sort(key=lambda m: dist.get(m, BIG))
+                moves.append((f, fwd[0]))
             else:
                 hold.append(f)
         return {"attacks": attacks, "moves": moves, "thin": thin,
-                "hold": hold, "done": False, "why": ""}
+                "hold": hold, "done": False, "why": "",
+                "direction": direction}
 
     def _blocking_countries(self, ag: nekoagent.Agent, player_addr: int,
                             path: list[int]) -> list[str]:
