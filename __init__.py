@@ -1901,11 +1901,13 @@ class HoI4AdvisorPlugin(NekoPluginBase):
         },
     )
     async def hoi4_take_command(self, *, action: str = "status", army: str = "",
-                                line: str = "", country: str = ""):
+                                line: str = "", country: str = "",
+                                target: str = ""):
         """接管/观察/守线/推进/交回。"""
         from . import command as command_mod
 
         action, army, line, country = _s(action), _s(army), _s(line), _s(country)
+        target = _s(target)
         act = action.strip().lower()
         player, err = await self._player_only(country, guard=False)
         if err is not None:
@@ -2007,10 +2009,98 @@ class HoI4AdvisorPlugin(NekoPluginBase):
                         "meta": {"front": len(b["front"]), "units": b["units"],
                                  "has_advice": False}}
 
+            if act in ("advance", "push", "推", "推进", "推一格", "进攻一格",
+                       "attack_one", "打一格"):
+                # 推一格：只让挨着目标的那几省部队进攻，别处的守线部队不动。
+                # 0.9.23 新加——以前没有"进攻"原语，模型只好用 move 把师调到
+                # 远处的敌省，结果线抽空了、师被扔进纵深、后路没人接。
+                raw = (line or target or "").strip()
+                if not raw:
+                    return {"ok": False,
+                            "display": "往哪推？给我一个省号或地名（就是紧挨着我们的那一格）。",
+                            "hint": "问用户推进目标；一次只推一格。"}
+                places = self._places()
+                try:
+                    pid, lab = places.resolve(raw.split(",")[0].strip())
+                except Exception:  # noqa: BLE001
+                    return {"ok": False,
+                            "display": f"「{raw}」这个地名我没认出来。给我省号也行。",
+                            "hint": "让用户给省号，或者说州名/城市名。"}
+                try:
+                    res = await asyncio.wait_for(
+                        asyncio.to_thread(cmd.advance, addr, int(pid), 0,
+                                          False, short),
+                        timeout=45.0)
+                except Exception as exc:  # noqa: BLE001
+                    return self._agent_error(exc)
+                if not res.get("active"):
+                    return {"ok": False,
+                            "display": "现在没接管任何部队，先说清楚把哪个集团军交给我。",
+                            "hint": "先 claim 一个集团军。"}
+                return {"ok": True, "display": res.get("note") or "",
+                        "hint": "原样转发。推一格不等于打得下来，别替她下结论。",
+                        "meta": {"target": int(pid), "label": lab,
+                                 "moved": res.get("moved", 0),
+                                 "from_provs": res.get("from_provs") or [],
+                                 "idle_neighbours": res.get("idle_neighbours") or []}}
+
             if act in ("hold", "守", "守线", "防线"):
                 if not line.strip():
                     return {"ok": False, "display": "守哪条线？说地名，比如「加来、布鲁塞尔、鹿特丹」。",
                             "hint": "问用户守哪里。"}
+                # 「前线 / 接敌 / 整条线」这种说法**不用再反过来问用户要省号**：
+                # 机械地取「我方控制且挨着交战国」的省。0.9.23 加——真机聊天记录里
+                # 模型连着三次回「你把要守的省号给本喵」，因为它手上没有这个集合。
+                _front_words = ("前线", "接敌", "整条", "全部", "所有", "前线全部",
+                                "front", "all", "自动")
+                _lw = line.strip().lower()
+                if any(w in _lw for w in _front_words):
+                    try:
+                        _f = await asyncio.wait_for(
+                            asyncio.to_thread(cmd.front, addr), timeout=25.0)
+                    except asyncio.TimeoutError:
+                        return {"ok": False,
+                                "display": "算前线超时了——版图哨兵正在刷新全服控制图"
+                                           "（一次十几秒），这会儿抢不上。"
+                                           "等十几秒再说一次「铺前线」，"
+                                           "或者直接点几个地名让我守。",
+                                "hint": "过一会儿重试，或者改成点名几个省。"}
+                    except Exception as exc:  # noqa: BLE001
+                        return self._agent_error(exc)
+                    fprovs = list(_f.get("provs") or [])
+                    if not fprovs:
+                        if (_f.get("why") or "") == "no_enemy":
+                            return {"ok": False,
+                                    "display": "还没认出跟谁在打，所以算不出前线在哪。"
+                                               "先让我看一眼前线（hoi4_frontline），"
+                                               "认出来再铺。",
+                                    "hint": "先调 hoi4_frontline 让 warscope 认出交战国。"}
+                        return {"ok": False,
+                                "display": "版图这会儿是空的——后台正在重扫全服控制图"
+                                           "（每 ~85 秒一遍，一次十几秒，转身让给工具查询时"
+                                           "就读不到）。等十几秒再说一次「铺前线」就行，"
+                                           "不是你的命令有问题。",
+                                "hint": "过十几秒重试；或者点名几个省让我守。"}
+                    places0 = self._places()
+                    labels = []
+                    for p in fprovs[:10]:
+                        try:
+                            labels.append(places0.label(p))
+                        except Exception:  # noqa: BLE001
+                            labels.append(str(p))
+                    _cap0 = max(3, min(len(fprovs), 60))
+                    _r0 = await asyncio.wait_for(
+                        asyncio.to_thread(cmd.hold, addr, fprovs, _cap0, False, short),
+                        timeout=45.0)
+                    note0 = _r0.get("note") or ""
+                    return {"ok": True,
+                            "display": (f"前线（我方挨着交战国的省）一共 {len(fprovs)} 个："
+                                        + "、".join(labels)
+                                        + ("…" if len(fprovs) > 10 else "")
+                                        + "\n\n" + note0),
+                            "hint": "原样转发。这是机械算出来的接敌省，不是我挑的重点。",
+                            "meta": {"front": fprovs, "moved": _r0.get("moved", 0),
+                                     "bad": _r0.get("bad") or []}}
                 places = self._places()
                 provs: list[int] = []
                 bad: list[str] = []
@@ -2596,6 +2686,11 @@ class HoI4AdvisorPlugin(NekoPluginBase):
     def _agent_error(exc: Exception) -> dict:
         """把进程内客户端的失败翻译成用户能照做的话。"""
         msg = getattr(exc, "message", "") or str(exc)
+        if not msg:
+            # 空消息的坑：`asyncio.TimeoutError` 的 str() 就是空串，直接透传
+            # 会让用户看到一片空白（0.9.23 真机踩到）。
+            msg = (f"{type(exc).__name__}：拿不到数据。"
+                   f"多半是后台正在全服扫描，等十几秒再试一次。")
         hint = getattr(exc, "hint", "") or "原样转发，别含糊成「出错了」。"
         return {"ok": False, "display": msg, "hint": hint}
 
@@ -2748,6 +2843,17 @@ class HoI4AdvisorPlugin(NekoPluginBase):
                 f"   命令进了引擎，但只有你已经对 {owner} **宣战时才会真的开进去**；"
                 f"没宣战的话它会一直挂着不动 —— 那不是命令丢了，是目标还不合法。",
             ])
+        # 跨省太远的提醒（0.9.23）：以前模型用 move 当进攻，把师从线上扔到纵深
+        # 好几个省外的敌省，后路没人接。这里只陈述事实并指向正确工具，不替她决定。
+        longest = max((len(p) for p in paths.values()), default=0)
+        if longest >= 3:
+            lines.extend([
+                "",
+                f"⚠ 这一单跨了 {longest} 个省（最长那条路线）。中途没有我方部队接应，"
+                f"师单独扎进纵深容易被切断后路。",
+                "   **推进的正规做法是 `take_command action=advance`，一次推一格**："
+                "它只动挨着目标那一格的部队，别处的守线部队不动，也不会把线抽空。",
+            ])
         if ok_n < len(group):
             bad = [r for r in res["results"] if not r["ok"]]
             lines.append("")
@@ -2771,6 +2877,10 @@ class HoI4AdvisorPlugin(NekoPluginBase):
         description=(
             "把《钢铁雄心4》里一支部队从 A 调到 B。**不是控制台作弊**，"
             "是用引擎自己的下单函数把行军路线写进部队，跟你右键地图一样。"
+            "**这是调动，不是进攻**：跨好几个省把师送进敌方纵深，后路没人接应，很容易被切断。"
+            "要往前打，用 `hoi4_take_command action=advance`，一次推一格——"
+            "它只动挨着目标那一格的部队，守线的师不用撤下来，线也不会空。"
+            "这里只用来：把预备队送去某个我方省、回防、换防、上岸后集结。"
             "用户说「把柏林的部队调到华沙」「让这几个师回防」时使用。"
         ),
         input_schema={
@@ -2848,18 +2958,28 @@ class HoI4AdvisorPlugin(NekoPluginBase):
             "action=brief 返回**战况事实清单**（我方几个师在哪、每个接邻的省里有"
             "哪国几个师、我方邻省能调几个师），里面没有建议也没有排序，打哪由你自己判断；"
             "action=hold 用 line 点名要守的省，代码按游戏的摆兵规则把部队摆过去；"
+            "line 直接写「前线」「接敌」也可以——那会机械地取「我方挨着交战国的省」，"
+            "**不要反过来问用户要省号**；"
+            "action=advance 推一格：用 target(line) 点名**紧挨着我们的那一格**，"
+            "只让挨着它的我方部队进攻它，别处的守线部队一个都不动；"
             "action=release 交回指挥权。"
+            "**推进就用 advance，一次一格，不要用 move 把师调到远处的敌省**——"
+            "move 会让那支师离开防线、跨好几个省扎进纵深，后路没人接，很容易被切断。"
+            "**守线的部队照样能进攻**：advance 动的就是线上挨着敌人的那些师，"
+            "不需要先把它们从防线上撤下来，也不会把线抽空。"
             "用户说「我把第X集团军指挥权给你」「看看战况」「守加来、布鲁塞尔」"
-            "「还给我」时使用。"
+            "「往但那泽推一格」「还给我」时使用。"
         ),
         input_schema={
             "type": "object",
             "properties": {
                 "action": {"type": "string",
-                           "description": "claim / status / brief / hold / release"},
+                           "description": "claim / status / brief / hold / advance / release"},
                 "army": {"type": "string", "description": "第9集团军"},
                 "line": {"type": "string",
                          "description": "要守的地名，逗号隔开（hold 用）"},
+                "target": {"type": "string",
+                           "description": "要推的那一格：省号或地名（advance 用，可省略、用 line 也行）"},
                 "country": {"type": "string", "description": "玩哪国，平时留空"},
             },
             "required": ["action"],
@@ -2867,9 +2987,11 @@ class HoI4AdvisorPlugin(NekoPluginBase):
         llm_result_fields=["ok", "display"],
     )
     async def entry_take_command(self, action: str = "status", army: str = "",
-                                 line: str = "", country: str = "", **_):
+                                 line: str = "", country: str = "",
+                                 target: str = "", **_):
         return Ok(await self.hoi4_take_command(
-            action=action, army=army, line=line, country=country))
+            action=action, army=army, line=line, country=country,
+            target=target))
 
     _trace("3.2 entry_look / entry_take_command 注册完成")
 

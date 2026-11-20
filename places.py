@@ -73,6 +73,16 @@ class Places:
     def state_name(self, state_id: int) -> str:
         return self._state_names.get(int(state_id)) or ""
 
+    def label(self, prov_id: int) -> str:
+        """省的中文标签：用所属州名，认不出州就退化成「省 <id>」。
+
+        只给省号看不出是哪儿（真机聊天记录里模型报「省 362」，用户得自己去地图上找）。
+        """
+        pid = int(prov_id)
+        sid = self._prov_to_state.get(pid)
+        nm = (self.state_name(sid) if sid else "") or ""
+        return f"{nm}（{pid}）" if nm else f"省 {pid}"
+
     def provinces_of_state(self, state_id: int) -> list[int]:
         return [p for p, s in self._prov_to_state.items() if s == int(state_id)]
 

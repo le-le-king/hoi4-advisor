@@ -616,6 +616,135 @@ class Commander:
         return self._fill(player_addr, player_short, [int(p) for p in line_provs],
                           max_units=max_units, dry_run=dry_run, what="守线")
 
+    def front(self, player_addr: int) -> dict:
+        """前线省列表（我方控制且挨着交战国）。返回 `{"provs": [...], "why": ...}`。
+
+        **不抢全服扫描**：控制图由版图哨兵每 ~85 秒在后台养一次，这里只读缓存。
+        直接扫一次要 14~19 秒，还会跟哨兵抢 DLL 的全局命令锁，一撞就超时
+        （`str(TimeoutError)` 是空串，用户只会看到一片空白）。
+
+        `why` 把"算不出来"的两种原因分开——0.9.23 之前只会笼统说"还没认出跟谁在打"，
+        真机上其实是**控制图被工具查询挤掉了**，说错了原因会让人往错的方向查：
+
+        - `no_enemy`：warscope 还没认出交战国（先读一次前线就能解决）
+        - `map_cold`：控制图正在被后台重扫，这一刻读不到（等十几秒）
+        - `""`：正常
+        """
+        ag = self._live.connect()
+        try:
+            out = self._live.front_provinces(ag, player_addr, allow_scan=False)
+            if out:
+                return {"provs": out, "why": ""}
+            if not self._live.enemy_names():
+                try:
+                    self._live.frontline(player_addr)
+                except Exception as exc:  # noqa: BLE001 认不出来就如实报空
+                    self._log(f"读前线失败（为了认交战国）："
+                              f"{type(exc).__name__}: {exc}")
+                out = self._live.front_provinces(ag, player_addr,
+                                                 allow_scan=False)
+                if out:
+                    return {"provs": out, "why": ""}
+                if not self._live.enemy_names():
+                    return {"provs": [], "why": "no_enemy"}
+            # 交战国已经认出来了，那算不出来只能是控制图这一会儿是空的
+            return {"provs": [], "why": "map_cold"}
+        finally:
+            ag.close()
+
+    def advance(self, player_addr: int, target: int, max_units: int = 0,
+                dry_run: bool = False, player_short: str = "") -> dict:
+        """**推一格**：让与 target 相邻的我方部队进攻 target。
+
+        为什么要有这个原语（0.9.23）：以前只有 `hold`（摆防线）和 `move`（调到某省），
+        没有"进攻"这个动作。于是模型把进攻实现成"把师调到敌方远处的省"，
+        四个毛病全从这一个缺口派生：
+
+        - 只有"没在守线"的师才敢动（守线的师已经挂在线上，再 move 出去线就空了）；
+        - 一进攻就把线抽空，因为它的动法就是 move；
+        - 目标选得很远（省 362、省 3295），因为没有一个"旁边那一格"的概念；
+        - 单个师被扔到纵深，后路没人接应。
+
+        这里的语义就是人在地图上做的那一下：**从相邻的我方省，往那一格打**。
+        - 只动与 target 相邻、且站在那儿的我方师；别处的守线部队**一个都不动**；
+        - 目标必须与我方相邻（隔一格就打不了，得先推进）；
+        - 报告里同时列出"相邻我方省里哪几个没人"——那是防线的空档，事实给她，要不要补她自己定。
+        """
+        st = self._read_state()
+        if not st:
+            return {"active": False}
+        ids = {int(i) for i in st.get("ids") or []}
+        if not ids:
+            raise CommandError("not_claimed", "现在没接管任何部队。")
+
+        target = int(target)
+        obs = self.observe(player_addr, player_short)
+        units, adj = obs["units"], obs["adj"]
+        mine = [u for u in units if int(u["uid"]) in ids]
+
+        neighbours = set(adj.get(target) or ())
+        if not neighbours:
+            raise CommandError("bad_input",
+                               f"省 {target} 一个陆地邻省都没有，不是能打的地方。")
+
+        # 出发省：既要是 target 的邻省，又得真有我们接管的师站在那儿。
+        from_provs = sorted({int(u["prov"]) for u in mine
+                             if int(u["prov"]) in neighbours})
+        if not from_provs:
+            where = sorted({int(u["prov"]) for u in mine})
+            raise CommandError(
+                "too_far",
+                f"接管的师没有一个挨着省 {target}，这一格现在打不了"
+                f"（我们的师在 {where[:12]}）。要打得先推进到它旁边。",
+                "先把部队往前推一格到 target 的邻省，下一轮再打 target。")
+
+        attackers = [u for u in mine if int(u["prov"]) in set(from_provs)]
+        # **每个出发省留 1 个师守家**（0.9.23）：一开始这里是把该省的师全派走，
+        # 于是 6590 那 12 个全扑上去、那一格空了——又变成"进攻把线抽空"。
+        # 按引擎的守线规则（每省保底一个），出发省至少留 1。
+        by_prov: dict[int, list] = {}
+        for u in attackers:
+            by_prov.setdefault(int(u["prov"]), []).append(u)
+        keep: list[int] = []
+        send: list = []
+        for p, us in sorted(by_prov.items()):
+            if len(us) <= 1:
+                send.extend(us)          # 就一个师，没有可留的
+                continue
+            send.extend(us[:-1])         # 留最后一个在家
+            keep.append(us[-1]["uid"])
+        attackers = send
+        # 相邻但我方没人驻守的省：防线空档，如实报给她
+        idle_src = sorted(neighbours - set(from_provs))
+
+        if max_units and len(attackers) > max_units:
+            attackers = attackers[:max_units]
+
+        rows = [{"dst": target,
+                 "addrs": [u["addr"] for u in attackers]}]
+        out = {"active": True, "army": st.get("army"), "target": target,
+               "from_provs": from_provs, "attackers": len(attackers),
+               "kept_home": keep, "idle_neighbours": idle_src,
+               "moved": 0, "dry_run": dry_run}
+        if dry_run:
+            out["note"] = (f"要从 {len(from_provs)} 个邻省出 {len(attackers)} 个师推省 "
+                           f"{target}，出发省各留 {len(keep)} 个守家（试运行，没动手）")
+            return out
+
+        r = self._apply(player_addr, rows, f"推省 {target}")
+        out["moved"] = r["done"]
+        out["failed"] = r["failed"]
+        out["note"] = r["note"]
+        if r.get("reasons"):
+            out["reasons"] = r["reasons"]
+
+        nid = [p for p in idle_src]
+        if nid:
+            out["note"] += (f"；顺带说一句：挨着 {target} 的我方邻省里还有 "
+                            f"{len(nid)} 个没有我们的师（{nid[:8]}），"
+                            f"那些口子要不要补你自己定。")
+        return out
+
     def _apply(self, player_addr: int, rows: list[dict],
                what: str) -> dict:
         """真正下命令。逐省一组，记录下达目标用于下一轮冲突检测。"""

@@ -1960,6 +1960,67 @@ class LiveGame:
             pass
         return f"国家#{cid}"
 
+    def enemy_cids(self, ag: nekoagent.Agent, player_addr: int,
+                   allow_scan: bool = False) -> set[int]:
+        """交战国的**国家序号**。warscope 给的是国名，用序号表翻过来。
+
+        `allow_scan=False`（默认）时表冷就返回空集——绝不为了它触发全服扫描
+        （5~14 秒，撞穿看门狗）。`allow_scan=True` 是给「一键铺前线」这种
+        用户主动发起、只做一次的动作用的：宁可慢一次，也不能算不出前线
+        然后反过来问用户要省号（0.9.22 真机聊天记录里连问了三次）。
+        """
+        hostile = self.enemy_names()
+        if not hostile:
+            return set()
+        try:
+            cn = self._cached_country_names(ag)
+        except Exception:  # noqa: BLE001
+            cn = {}
+        if not cn and allow_scan:
+            try:
+                cn = self._country_names(ag)
+            except Exception:  # noqa: BLE001
+                cn = {}
+        return {cid for cid, nm in cn.items()
+                if nm in hostile and 0 < cid < 10000}
+
+    def front_provinces(self, ag: nekoagent.Agent, player_addr: int,
+                        allow_scan: bool = False) -> list[int]:
+        """**前线**＝我方控制、且与交战国控制的省相邻的省。
+
+        纯机械集合：不比大小、不排序、不挑重点，就是把"挨着敌人的那些自家省"
+        列出来。0.9.23 加——用户说「铺前线」时，模型以前只能反过来问用户要省号
+        （真机聊天记录里连着问了三次），因为它手上没有"前线在哪"这个集合。
+
+        交战国认不出来就返回空表，调用方如实说"还没认出跟谁在打"。
+        """
+        ecids = self.enemy_cids(ag, player_addr, allow_scan=allow_scan)
+        if not ecids:
+            return []
+        try:
+            pcid = ag.d(player_addr + OFF_COUNTRY_ID)
+        except (nekoagent.AgentError, RuntimeError):
+            return []
+        if not (0 < pcid < 10000):
+            return []
+        try:
+            cm = self.control_map(ttl=180.0, peek_only=True)
+        except Exception:  # noqa: BLE001
+            return []
+        ctrl = cm.get("prov_ctrl") or {}
+        if not ctrl:
+            return []
+        adj = self.adjacency()
+        out: list[int] = []
+        for p, c in ctrl.items():
+            if c != pcid:
+                continue
+            for nb in adj.get(int(p)) or ():
+                if ctrl.get(nb) in ecids:
+                    out.append(int(p))
+                    break
+        return sorted(out)
+
     def _blocking_countries(self, ag: nekoagent.Agent, player_addr: int,
                             path: list[int]) -> list[str]:
         """一条（不合法的）路线里，哪些国家的地盘挡了道。只用来解释原因。"""
