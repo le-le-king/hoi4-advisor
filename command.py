@@ -874,22 +874,31 @@ class Commander:
     def offensive(self, player_addr: int, target: int = 0, units: str = "",
                   player_short: str = "", stop: bool = False,
                   step: bool = True) -> dict:
-        """**画一条进攻线**：她给目标 + 指定几个师，这几个师一格一格推过去。
+        """**画一条进攻线**：她给目标 + 指定几个师，战线整体朝目标压过去。
 
-        仿的是游戏里那个动作：在地图上拉一条箭头，指定几支部队，它们就沿着
-        箭头方向一个省一个省地打，**每推一格都留人填线**。
+        仿的是原游戏那个动作：在地图上拉一条线、指定几支部队，**整条线上的
+        部队同时向前压**，战线一格一格整体前移，直到站到目标省上。
 
-        和 `advance` 的分工：
-        - `advance` 是**一格**：说打哪就打哪，一步一令（微操用它）；
-        - `offensive` 是**一条线**：说去哪，之后每轮自己找"朝目标该打的下一格"，
-          打完再找下一格，直到站在目标上。
+        0.10.2 那版是"算一条最短路、取路径上第一格"，被用户否掉：
+
+        > 照你的写法，实现的效果是十几个师从一个宽度一省小缝隙里突入到敌军腹地。
+
+        那版每次只认**一个**下一格，所以整个集团军永远从一个省宽的缺口往里钻。
+        现在改成全线推进（`livegame.front_push`）：
+
+        1. 有部队的**每一个**出发省，各找自己"当面之敌"（非我方邻省里离目标
+           最近的那个，且不比自己更远——不许往回打）；
+        2. 这些进攻**同一轮里一起下达**，推出去的是一整条带；
+        3. 已经压过去、身后成了自己地盘的省，让部队**跟进**（`moves`），
+           不然兵堆在后方、战线卡死。
 
         保证填线靠三层：
-        1. 每一步只派**挨着那一格**的指定师（`advance` 的规则）；
-        2. 每个出发省各留 1 个守家；
-        3. **上一格没打下来就不重复下令**——不会把同一批师反复往墙上撞。
 
-        状态存在接管记录里（`plan.offensive`），所以插件重载后线还在。
+        1. 只派**本省**的兵去打本省的当面之敌，别处的线不动；
+        2. 每个出发省各留 1 个守家（只剩 1 个的省不推，列进 `thin` 报给她）；
+        3. **正在打的那些省不重复下令**——不会把同一批师反复往墙上撞。
+
+        状态存在接管记录里（`plan.offensive`），插件重载后线还在。
         `stop=True` 撤线。
         """
         st = self._read_state()
@@ -912,6 +921,7 @@ class Commander:
             ids = {int(i) for i in st.get("ids") or []}
             pool = [u for u in obs["units"] if int(u["uid"]) in ids]
             spec = (units or "").strip()
+            miss: list[str] = []
             if spec:
                 picked = self.pick_units(spec, pool)
                 if not picked["units"]:
@@ -924,9 +934,8 @@ class Commander:
                 miss = picked["miss"]
             else:
                 uids = sorted(ids)
-                miss = []
             cur = {"target": int(target or cur.get("target") or 0),
-                   "uids": uids, "pending": 0, "step": 0, "log": []}
+                   "uids": uids, "pending": [], "step": 0, "log": []}
             if not cur["target"]:
                 raise CommandError("bad_input",
                                    "进攻线要有个目标：说一个省号或者地名。")
@@ -943,72 +952,117 @@ class Commander:
             return {"active": True, "line": cur, "note": "进攻线在，这次没推。"}
 
         target_p = int(cur["target"])
-        uids = [int(u) for u in cur.get("uids") or []]
+        uids = {int(u) for u in cur.get("uids") or []}
         obs = self.observe(player_addr, player_short)
         ids = {int(i) for i in st.get("ids") or []}
-        pool = [u for u in obs["units"] if int(u["uid"]) in ids]
-        mine = [u for u in pool if int(u["uid"]) in set(uids)]
+        mine = [u for u in obs["units"]
+                if int(u["uid"]) in ids and int(u["uid"]) in uids]
         if not mine:
             raise CommandError("no_such_unit",
                                "进攻线上指定的师一个都不在接管名单里了"
                                "（被打散、换防，或者交回指挥权了）。")
 
-        # 上一格打下来没？
-        pending = int(cur.get("pending") or 0)
-        if pending:
-            ours_now = self._live.controlled_provs(player_addr, [pending])
-            if pending not in set(ours_now):
-                return {"active": True, "line": cur, "waiting": pending,
-                        "note": (f"进攻线（目标 {target_p}）：上一格 {pending} 还在打，"
-                                 f"没重复下令。打下来我会自己往下一格推。")}
-            cur["log"] = (cur.get("log") or [])[-20:] + [pending]
-            cur["step"] = int(cur.get("step") or 0) + 1
-            cur["pending"] = 0
+        holders: dict[int, list[int]] = {}
+        for u in mine:
+            holders.setdefault(int(u["prov"]), []).append(int(u["addr"]))
 
-        starts = sorted({int(u["prov"]) for u in mine})
         ag = self._live.connect()
         try:
-            nxt = self._live.next_step_toward(ag, player_addr, starts, target_p)
+            fp = self._live.front_push(ag, player_addr, holders, target_p)
         finally:
             ag.close()
 
-        if not nxt.get("next"):
-            why = nxt.get("why") or ""
-            cur["pending"] = 0
+        if fp.get("why") == "map_cold":
+            return {"active": True, "line": cur, "map_cold": True,
+                    "note": ("进攻线（目标 %d）：版图这会儿是空的（后台正在重扫全服"
+                             "控制图，一次十几秒）。等十几秒我再往下推，"
+                             "不是你的线有问题。" % target_p)}
+
+        pending = [int(p) for p in (cur.get("pending") or [])]
+        if pending:
+            got = set(self._live.controlled_provs(player_addr, pending))
+            still = [p for p in pending if p not in got]
+            new_done = [p for p in pending if p in got]
+        else:
+            still, new_done = [], []
+        cur["log"] = (cur.get("log") or [])[-20:] + new_done
+        cur["step"] = int(cur.get("step") or 0) + len(new_done)
+
+        if fp.get("done"):
+            cur["pending"] = []
             plan["offensive"] = cur
             st["plan"] = plan
             self._write_state(st)
-            if why == "already_ours":
-                return {"active": True, "line": cur, "done": True,
-                        "note": (f"进攻线（目标 {target_p}）：指定的师已经站在目标上了，"
-                                 f"这轮没别的要打。共推了 {cur.get('step', 0)} 格。")}
-            return {"active": True, "line": cur, "stuck": why,
-                    "note": (f"进攻线（目标 {target_p}）：从现在的出发省算不出通往目标的"
-                             f"陆路（{'找不到路线' if why == 'no_route' else '没有出发省'}）。"
-                             f"要么换个目标，要么先把部队挪到目标附近。")}
+            return {"active": True, "line": cur, "done": True,
+                    "note": (f"进攻线（目标 {target_p}）：目标已经在我方手里了，"
+                             f"这条线走完了。共推了 {cur.get('step', 0)} 格。")}
 
-        nxt_p = int(nxt["next"])
-        spec = ",".join(str(u) for u in uids)
-        try:
-            r = self.advance(player_addr, nxt_p, 0, False, player_short,
-                             only_units=spec)
-        except CommandError as exc:
-            return {"active": True, "line": cur, "too_far": nxt_p,
-                    "note": (f"进攻线（目标 {target_p}）：朝目标该打的下一格是 {nxt_p}，"
-                             f"但指定的师还挨不着它（{exc.message}）。"
-                             f"要么让他们先挪过去，要么把线画到打得到的地方。")}
-        cur["pending"] = nxt_p
-        cur["log"] = (cur.get("log") or [])[-20:]
+        # 组装这一轮要下的令：全线同时推 + 掉队的跟进
+        rows: list[dict] = []
+        pushed: list[int] = []
+        moved: list[int] = []
+        already = set(still)
+        for f, n in fp.get("attacks") or []:
+            if n in already:
+                continue                      # 上一轮就在打，不重复下令
+            us = holders.get(int(f)) or []
+            send = us[:-1] if len(us) > 1 else []
+            if not send:
+                continue
+            rows.append({"dst": int(n), "addrs": send})
+            pushed.append(int(n))
+            already.add(int(n))
+        for f, m in fp.get("moves") or []:
+            us = holders.get(int(f)) or []
+            # 跟进的是**后方省**（已经不挨着敌人了），所以整个走光也不用留人。
+            # 留 1 个的话每推一格就啃掉一个师，两格之后整条线就没兵了
+            # （离线验证 _p185 实测到：第三轮起全线只剩 1 个师、推不动）。
+            send = list(us)
+            if not send:
+                continue
+            rows.append({"dst": int(m), "addrs": send})
+            moved.append(int(m))
+
+        thin = [int(p) for p in (fp.get("thin") or [])]
+        if not rows:
+            cur["pending"] = sorted(already)
+            plan["offensive"] = cur
+            st["plan"] = plan
+            self._write_state(st)
+            bits = [f"进攻线（目标 {target_p}）：这一轮没有能推的地方。"]
+            if still:
+                bits.append(f"还在打 {'、'.join(str(p) for p in still[:6])}。")
+            if thin:
+                bits.append(f"有 {len(thin)} 个出发省只剩 1 个师"
+                            f"（{'、'.join(str(p) for p in thin[:6])}），"
+                            f"抽不出人推——要推得往那儿添兵。")
+            if fp.get("hold"):
+                bits.append(f"{len(fp['hold'])} 个省既没有当面之敌也没法跟进。")
+            return {"active": True, "line": cur, "stalled": True,
+                    "note": "".join(bits)}
+
+        r = self._apply(player_addr, rows, f"进攻线（目标 {target_p}）")
+        cur["pending"] = sorted(already)
         plan["offensive"] = cur
         st["plan"] = plan
         self._write_state(st)
 
-        rest = int(nxt.get("cost") or 0)
-        note = (f"进攻线（目标 {target_p}）：这一步推 {nxt_p}"
-                f"（离目标还有 {rest} 格要打）。{r.get('note') or ''}")
-        return {"active": True, "line": cur, "stepped": nxt_p,
-                "moved": r.get("moved", 0), "note": note,
-                "idle_neighbours": r.get("idle_neighbours") or []}
+        dist = None
+        heads = "、".join(str(p) for p in pushed[:8]) or "（无）"
+        note = (f"进攻线（目标 {target_p}）：**全线 {len(pushed)} 个省同时向前压**"
+                f"（{heads}）")
+        if moved:
+            note += f"，另有 {len(moved)} 个省让部队跟进到新战线"
+        note += f"。{r.get('note') or ''}"
+        if still:
+            note += f" 上一轮还在打的：{'、'.join(str(p) for p in still[:5])}。"
+        if thin:
+            note += (f" ⚠ 有 {len(thin)} 个出发省只剩 1 个师"
+                     f"（{'、'.join(str(p) for p in thin[:5])}），"
+                     f"为了不留空档没让它们推——想推得往那儿添兵。")
+        return {"active": True, "line": cur, "pushed": pushed, "moved": moved,
+                "thin": thin, "still": still, "moved_units": r.get("moved", 0),
+                "note": note}
 
     def _apply(self, player_addr: int, rows: list[dict],
                what: str) -> dict:

@@ -2031,75 +2031,112 @@ class LiveGame:
                     break
         return sorted(out)
 
-    def next_step_toward(self, ag: nekoagent.Agent, player_addr: int,
-                         starts: list[int], objective: int,
-                         tol: float = 6.0) -> dict:
-        """从 `starts` 出发朝 `objective` 走，**第一个需要夺取的省**是哪一个。
+    def distances_to(self, objective: int) -> dict[int, int]:
+        """从 objective 出发，按陆地邻接做一遍 BFS，返回 省 → 跳数。
 
-        仿游戏里那条进攻线：目标是终点，兵一格一格挪过去。做法是 0-1 BFS——
-        走自己控制的省不花代价（0），走进别人的省记 1（得打下来）。最早的
-        那条"要打才能过"的省就是下一步该打的那一格。
-
-        返回 `{"next": 省号 或 0, "path": [...], "cost": 打几格, "why": ""}`
-        `next == 0` 表示不用打（已经在目标上）或者走不到。
+        用来判"哪个邻省更靠近目标"。走自己的省和走敌人的省**都算 1 跳**——
+        这里只关心地理远近，不关心要不要打（要不要打由 `front_push` 判）。
         """
         objective = int(objective)
-        starts = [int(s) for s in (starts or []) if s]
-        if not starts:
-            return {"next": 0, "path": [], "cost": 0, "why": "no_start"}
+        adj = self.adjacency()
+        dist: dict[int, int] = {objective: 0}
+        queue = [objective]
+        head = 0
+        while head < len(queue):
+            p = queue[head]
+            head += 1
+            d = dist[p] + 1
+            for nb in adj.get(p) or ():
+                nb = int(nb)
+                if nb not in dist:
+                    dist[nb] = d
+                    queue.append(nb)
+        return dist
+
+    def front_push(self, ag: nekoagent.Agent, player_addr: int,
+                   holders: dict[int, list[int]], objective: int) -> dict:
+        """**全线推进方案**（仿原游戏那条进攻线）。
+
+        `holders` = {出发省: [参战师的地址...]}——她指定参战的那批师现在各在哪个省。
+
+        为什么不是"算一条最短路、取第一格"（0.10.2 的做法，用户否掉了）：
+
+        > 照你的写法，实现的效果是十几个师从一个宽度一省小缝隙里突入到敌军腹地，
+        > 请参考原游戏。
+
+        那条路径式算法每次只认**一个**下一格，所以整个集团军永远从一个省宽的
+        缺口往里钻。原游戏的进攻线不是这样：**战线是一条连续的横线，整条线
+        上的部队同时向前压**，压过去之后战线整体前移一格。这里照这个来：
+
+        1. 对**每一个**有部队的出发省，各找它自己"当面之敌"（非我方的邻省里
+           离目标最近的那个，且不能比现在还远——不能往回打）；
+        2. 这些进攻**同时下达**，于是推进的是一整条带，不是一个点；
+        3. 已经压到敌人前面、身后成了自己地盘的省，让部队**跟上去**（`moves`），
+           不然兵堆在后方、战线卡住（原游戏里战线前移时部队会自动跟进）。
+
+        返回：
+
+        | 键 | 含义 |
+        |---|---|
+        | `attacks` | `[(出发省, 打哪个敌省)]`，同时下达 |
+        | `moves` | `[(出发省, 跟进到哪个我方省)]` |
+        | `thin` | 只有 1 个师的出发省：抽不出人，留着填线 |
+        | `hold` | 没有当面之敌也没法跟进的省 |
+        | `done` | 目标已经在我方手里 |
+        | `why` | `""` / `map_cold` |
+        """
+        objective = int(objective)
         try:
             pcid = ag.d(player_addr + OFF_COUNTRY_ID)
         except (nekoagent.AgentError, RuntimeError):
             pcid = 0
-        cm = {}
+        ctrl: dict = {}
         try:
-            cm = self.control_map(ttl=180.0, peek_only=True)
+            ctrl = (self.control_map(ttl=180.0, peek_only=True)
+                    .get("prov_ctrl") or {})
         except Exception:  # noqa: BLE001
-            cm = {}
-        ctrl = cm.get("prov_ctrl") or {}
-        ours = set()
-        if ctrl and pcid:
-            ours = {int(p) for p, c in ctrl.items() if c == pcid}
-        else:
-            # 控制图冷：至少把出发省当自己的，不然一步都算不出来
-            ours = set(starts)
+            ctrl = {}
+        if not ctrl or not pcid:
+            # 版图冷的时候至少把出发省当自己的，否则一步都算不出来
+            return {"attacks": [], "moves": [], "thin": [], "hold": [],
+                    "done": False, "why": "map_cold"}
+        ours = {int(p) for p, c in ctrl.items() if c == pcid}
+        if objective in ours:
+            return {"attacks": [], "moves": [], "thin": [], "hold": [],
+                    "done": True, "why": ""}
+        dist = self.distances_to(objective)
         adj = self.adjacency()
-
-        import heapq
-        INF = float("inf")
-        dist: dict[int, float] = {s: 0.0 for s in starts}
-        prev: dict[int, int] = {}
-        pq = [(0.0, s) for s in starts]
-        heapq.heapify(pq)
-        seen: set[int] = set()
-        while pq:
-            d, p = heapq.heappop(pq)
-            if p in seen:
-                continue
-            seen.add(p)
-            if p == objective:
-                break
-            for nb in adj.get(p) or ():
-                nb = int(nb)
-                w = 0.0 if nb in ours else 1.0
-                nd = d + w
-                if nd < dist.get(nb, INF):
-                    dist[nb] = nd
-                    prev[nb] = p
-                    heapq.heappush(pq, (nd, nb))
-        if objective not in dist:
-            return {"next": 0, "path": [], "cost": 0, "why": "no_route"}
-        path = [objective]
-        while path[-1] in prev:
-            path.append(prev[path[-1]])
-        path.reverse()
-        # 第一个"不是我们的"省 = 下一步要打的
-        for p in path:
-            if p not in ours:
-                return {"next": int(p), "path": path,
-                        "cost": int(dist[objective]), "why": ""}
-        return {"next": 0, "path": path, "cost": int(dist[objective]),
-                "why": "already_ours"}
+        BIG = 1 << 30
+        attacks: list[tuple[int, int]] = []
+        moves: list[tuple[int, int]] = []
+        thin: list[int] = []
+        hold: list[int] = []
+        for f, addrs in sorted(holders.items()):
+            f = int(f)
+            d_f = dist.get(f, BIG)
+            incoming = [int(n) for n in (adj.get(f) or ()) if int(n) not in ours]
+            if incoming:
+                # 这一格还挨着敌人：它是**前线省**，得留人填线
+                if len(addrs) <= 1:
+                    # 只有一个师：抽走这一格就空了。整条线是"抽得出人才推"
+                    thin.append(f)
+                    continue
+                best = min(incoming, key=lambda n: dist.get(n, BIG))
+                if dist.get(best, BIG) <= d_f:
+                    attacks.append((f, best))
+                    continue
+            # 跟前没有更近的敌省：这一格已经压过去了，让它**整个跟上去**。
+            # 后方省已经不再挨着敌人，不需要留驻军——留 1 个的话每推一格就
+            # 啃掉一个师，两格之后整条线就没兵了（离线验证 _p185 实测到）。
+            fwd = [int(m) for m in (adj.get(f) or ())
+                   if int(m) in ours and dist.get(int(m), BIG) < d_f
+                   and any(int(nb) not in ours for nb in (adj.get(int(m)) or ()))]
+            if fwd and addrs:
+                moves.append((f, min(fwd, key=lambda m: dist.get(m, BIG))))
+            else:
+                hold.append(f)
+        return {"attacks": attacks, "moves": moves, "thin": thin,
+                "hold": hold, "done": False, "why": ""}
 
     def _blocking_countries(self, ag: nekoagent.Agent, player_addr: int,
                             path: list[int]) -> list[str]:
