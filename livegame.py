@@ -809,9 +809,19 @@ class LiveGame:
             if not _heap(u):
                 continue
             try:
-                out.append(self._describe(ag, u, idx))
+                info = self._describe(ag, u, idx)
             except (nekoagent.AgentError, RuntimeError):
                 continue
+            # 0.10.2：把师 id 也带上。`_unit_ids` 一直读得到（`OFF_UNIT_ID`），
+            # 但这里没带，于是**只有按 id 取的那条路能点名认师**，
+            # `hoi4_move` 拿到的记录没有 uid，按番号点名就永远认不出来。
+            try:
+                uid = ag.d(u + OFF_UNIT_ID)
+                if 0 < uid < 2_000_000:
+                    info["uid"] = int(uid)
+            except (nekoagent.AgentError, RuntimeError):
+                pass
+            out.append(info)
         return out
 
     # ── 编制 / 兵种 ────────────────────────────
@@ -2020,6 +2030,76 @@ class LiveGame:
                     out.append(int(p))
                     break
         return sorted(out)
+
+    def next_step_toward(self, ag: nekoagent.Agent, player_addr: int,
+                         starts: list[int], objective: int,
+                         tol: float = 6.0) -> dict:
+        """从 `starts` 出发朝 `objective` 走，**第一个需要夺取的省**是哪一个。
+
+        仿游戏里那条进攻线：目标是终点，兵一格一格挪过去。做法是 0-1 BFS——
+        走自己控制的省不花代价（0），走进别人的省记 1（得打下来）。最早的
+        那条"要打才能过"的省就是下一步该打的那一格。
+
+        返回 `{"next": 省号 或 0, "path": [...], "cost": 打几格, "why": ""}`
+        `next == 0` 表示不用打（已经在目标上）或者走不到。
+        """
+        objective = int(objective)
+        starts = [int(s) for s in (starts or []) if s]
+        if not starts:
+            return {"next": 0, "path": [], "cost": 0, "why": "no_start"}
+        try:
+            pcid = ag.d(player_addr + OFF_COUNTRY_ID)
+        except (nekoagent.AgentError, RuntimeError):
+            pcid = 0
+        cm = {}
+        try:
+            cm = self.control_map(ttl=180.0, peek_only=True)
+        except Exception:  # noqa: BLE001
+            cm = {}
+        ctrl = cm.get("prov_ctrl") or {}
+        ours = set()
+        if ctrl and pcid:
+            ours = {int(p) for p, c in ctrl.items() if c == pcid}
+        else:
+            # 控制图冷：至少把出发省当自己的，不然一步都算不出来
+            ours = set(starts)
+        adj = self.adjacency()
+
+        import heapq
+        INF = float("inf")
+        dist: dict[int, float] = {s: 0.0 for s in starts}
+        prev: dict[int, int] = {}
+        pq = [(0.0, s) for s in starts]
+        heapq.heapify(pq)
+        seen: set[int] = set()
+        while pq:
+            d, p = heapq.heappop(pq)
+            if p in seen:
+                continue
+            seen.add(p)
+            if p == objective:
+                break
+            for nb in adj.get(p) or ():
+                nb = int(nb)
+                w = 0.0 if nb in ours else 1.0
+                nd = d + w
+                if nd < dist.get(nb, INF):
+                    dist[nb] = nd
+                    prev[nb] = p
+                    heapq.heappush(pq, (nd, nb))
+        if objective not in dist:
+            return {"next": 0, "path": [], "cost": 0, "why": "no_route"}
+        path = [objective]
+        while path[-1] in prev:
+            path.append(prev[path[-1]])
+        path.reverse()
+        # 第一个"不是我们的"省 = 下一步要打的
+        for p in path:
+            if p not in ours:
+                return {"next": int(p), "path": path,
+                        "cost": int(dist[objective]), "why": ""}
+        return {"next": 0, "path": path, "cost": int(dist[objective]),
+                "why": "already_ours"}
 
     def _blocking_countries(self, ag: nekoagent.Agent, player_addr: int,
                             path: list[int]) -> list[str]:

@@ -1902,12 +1902,13 @@ class HoI4AdvisorPlugin(NekoPluginBase):
     )
     async def hoi4_take_command(self, *, action: str = "status", army: str = "",
                                 line: str = "", country: str = "",
-                                target: str = ""):
+                                target: str = "", units: str = ""):
         """接管/观察/守线/推进/交回。"""
         from . import command as command_mod
 
         action, army, line, country = _s(action), _s(army), _s(line), _s(country)
         target = _s(target)
+        units = _s(units)
         act = action.strip().lower()
         player, err = await self._player_only(country, guard=False)
         if err is not None:
@@ -2029,7 +2030,7 @@ class HoI4AdvisorPlugin(NekoPluginBase):
                 try:
                     res = await asyncio.wait_for(
                         asyncio.to_thread(cmd.advance, addr, int(pid), 0,
-                                          False, short),
+                                          False, short, units),
                         timeout=45.0)
                 except Exception as exc:  # noqa: BLE001
                     return self._agent_error(exc)
@@ -2043,6 +2044,38 @@ class HoI4AdvisorPlugin(NekoPluginBase):
                                  "moved": res.get("moved", 0),
                                  "from_provs": res.get("from_provs") or [],
                                  "idle_neighbours": res.get("idle_neighbours") or []}}
+
+            if act in ("offensive", "进攻线", "画线", "推线", "attack_line",
+                       "offensive_stop", "撤线", "取消进攻线"):
+                stop = act in ("offensive_stop", "撤线", "取消进攻线")
+                raw = (target or line or "").strip()
+                tid = 0
+                if not stop and raw:
+                    places = self._places()
+                    try:
+                        tid, _lab2 = places.resolve(raw.split(",")[0].strip())
+                    except Exception:  # noqa: BLE001
+                        return {"ok": False,
+                                "display": f"「{raw}」这个目标我没认出来。给我省号也行。",
+                                "hint": "让用户给目标省号或地名。"}
+                try:
+                    res = await asyncio.wait_for(
+                        asyncio.to_thread(cmd.offensive, addr, int(tid),
+                                          units, short, stop, True),
+                        timeout=45.0)
+                except Exception as exc:  # noqa: BLE001
+                    return self._agent_error(exc)
+                if not res.get("active"):
+                    return {"ok": False,
+                            "display": "现在没接管任何部队，先说清楚把哪个集团军交给我。",
+                            "hint": "先 claim 一个集团军。"}
+                return {"ok": True, "display": res.get("note") or "",
+                        "hint": ("原样转发。进攻线是**她画的**，代码只负责一格一格执行；"
+                                 "推了一格不等于打下来了，别说成已经拿下。"),
+                        "meta": {"line": res.get("line") or {},
+                                 "stepped": res.get("stepped"),
+                                 "waiting": res.get("waiting"),
+                                 "done": res.get("done")}}
 
             if act in ("hold", "守", "守线", "防线"):
                 if not line.strip():
@@ -2090,7 +2123,7 @@ class HoI4AdvisorPlugin(NekoPluginBase):
                             labels.append(str(p))
                     _cap0 = max(3, min(len(fprovs), 60))
                     _r0 = await asyncio.wait_for(
-                        asyncio.to_thread(cmd.hold, addr, fprovs, _cap0, False, short),
+                        asyncio.to_thread(cmd.hold, addr, fprovs, _cap0, False, short, units),
                         timeout=45.0)
                     note0 = _r0.get("note") or ""
                     return {"ok": True,
@@ -2123,7 +2156,7 @@ class HoI4AdvisorPlugin(NekoPluginBase):
                 # 师数兜住，不会超发。
                 _cap = max(3, min(len(provs), 60))
                 res = await asyncio.wait_for(
-                    asyncio.to_thread(cmd.hold, addr, provs, _cap, False, short),
+                    asyncio.to_thread(cmd.hold, addr, provs, _cap, False, short, units),
                     timeout=45.0)
                 note = res.get("note") or (
                     "现在没接管任何部队（游戏重开过、或者接管状态过期了）。"
@@ -2696,7 +2729,8 @@ class HoI4AdvisorPlugin(NekoPluginBase):
 
     async def _do_move_live(self, from_place: str, to_place: str,
                             count: int = 0, country: str = "",
-                            mine: bool = False, unit_type: str = "") -> dict:
+                            mine: bool = False, unit_type: str = "",
+                            unit_spec: str = "") -> dict:
         """调兵全流程：认地名 → 认人 → 找师 → 算路 → 下单 → 报告。"""
         from_place, to_place = _s(from_place), _s(to_place)
         try:
@@ -2771,6 +2805,24 @@ class HoI4AdvisorPlugin(NekoPluginBase):
                     "meta": {"unit_type": unit_type, "available": have},
                 }
             group = picked
+        if (unit_spec or "").strip():
+            # 微操：她点名要动的是**哪几个师**（番号/兵种/uid）。
+            # 以前只能按"出发地"整省抓，想单独把一个师绕出去做包围做不到。
+            from . import command as command_mod
+            _picked = command_mod.pick_from(
+                unit_spec, group, command_mod.load_unit_names(config.data_dir()))
+            if not _picked["units"]:
+                have = livegame.LiveGame.template_summary(group)
+                return {
+                    "ok": False,
+                    "display": (f"{from_label} 里没有你说的那几个师：「{unit_spec}」。\n"
+                                + (f"那里现有：{have}" if have else "那里一个师都没有。")),
+                    "hint": "把现有的番号/编制名列出来让用户挑，别自己换一个师去调。",
+                    "meta": {"units": unit_spec, "available": have},
+                }
+            group = _picked["units"]
+            if _picked["miss"]:
+                self._log(f"调兵点名：没认出 {'、'.join(_picked['miss'])}")
         if mine:
             # 只动"归我指挥"的那几个师。用户按 F7 交过来的那几支，
             # 跟"这个省里所有的师"经常不是一回事——不分清就是抢兵权。
@@ -2880,20 +2932,26 @@ class HoI4AdvisorPlugin(NekoPluginBase):
             "**这是调动，不是进攻**：跨好几个省把师送进敌方纵深，后路没人接应，很容易被切断。"
             "要往前打，用 `hoi4_take_command action=advance`，一次推一格——"
             "它只动挨着目标那一格的部队，守线的师不用撤下来，线也不会空。"
-            "这里只用来：把预备队送去某个我方省、回防、换防、上岸后集结。"
-            "用户说「把柏林的部队调到华沙」「让这几个师回防」时使用。"
+            "这里只用来：把预备队送去某个我方省、回防、换防、上岸后集结，"
+            "**以及微操**——想单独把某一个师绕到某个省（做包围、堵口子），"
+            "用 units 点名那个师。"
+            "用户说「把柏林的部队调到华沙」「让第3山地师绕到但泽」时使用。"
         ),
         input_schema={
             "type": "object",
             "properties": {
                 "from_place": {"type": "string", "description": "出发地：州名或省编号"},
                 "to_place": {"type": "string", "description": "目的地：州名或省编号"},
+                "units": {"type": "string",
+                          "description": "只动这几个师：番号「第3山地师」/兵种「装甲」/"
+                                         "uid「96,97」，逗号分隔。留空=整个出发地都动"},
             },
             "required": ["from_place", "to_place"],
         },
         llm_result_fields=["ok", "display"],
     )
-    async def entry_move(self, from_place: str = "", to_place: str = "", **_):
+    async def entry_move(self, from_place: str = "", to_place: str = "",
+                         units: str = "", **_):
         fp, tp = _s(from_place).strip(), _s(to_place).strip()
         if not fp or not tp:
             return Ok({
@@ -2901,7 +2959,7 @@ class HoI4AdvisorPlugin(NekoPluginBase):
                 "display": "要说清从哪调到哪。比如「把柏林的部队调到华沙」。",
                 "hint": "原样转发。",
             })
-        return Ok(await self._do_move_live(fp, tp))
+        return Ok(await self._do_move_live(fp, tp, unit_spec=_s(units)))
 
     @plugin_entry(
         id="hoi4_units_near",
@@ -2960,26 +3018,34 @@ class HoI4AdvisorPlugin(NekoPluginBase):
             "action=hold 用 line 点名要守的省，代码按游戏的摆兵规则把部队摆过去；"
             "line 直接写「前线」「接敌」也可以——那会机械地取「我方挨着交战国的省」，"
             "**不要反过来问用户要省号**；"
-            "action=advance 推一格：用 target(line) 点名**紧挨着我们的那一格**，"
-            "只让挨着它的我方部队进攻它，别处的守线部队一个都不动；"
-            "action=release 交回指挥权。"
-            "**推进就用 advance，一次一格，不要用 move 把师调到远处的敌省**——"
+            "action=advance 推一格（微操的基本动作）：用 target(line) 点名"
+            "**紧挨着我们的那一格**，只让挨着它的我方部队进攻它，别处的守线部队不动；"
+            "action=offensive **画进攻线**：给 target（目标省）+ units（派哪几个师），"
+            "这几个师就一格一格朝目标推，每推一格都留人填线，上一格没打下来不重复下令；"
+            "action=offensive_stop 撤掉进攻线。"
+            "**units 用来点名具体哪几个师**（点谁守哪、派谁去打），"
+            "三种写法都认、可混用逗号分隔：番号「第3山地师」、兵种「装甲/山地/SS/摩托化」、uid「96,97」。"
+            "**推进就用 advance 或 offensive，不要用 move 把师调到远处的敌省**——"
             "move 会让那支师离开防线、跨好几个省扎进纵深，后路没人接，很容易被切断。"
-            "**守线的部队照样能进攻**：advance 动的就是线上挨着敌人的那些师，"
-            "不需要先把它们从防线上撤下来，也不会把线抽空。"
+            "**守线的部队照样能进攻**：它们就在线上挨着敌人，直接就能打，"
+            "不需要先撤下来，也不会把线抽空。"
             "用户说「我把第X集团军指挥权给你」「看看战况」「守加来、布鲁塞尔」"
-            "「往但那泽推一格」「还给我」时使用。"
+            "「让第3山地师打克拉科夫」「朝华沙画一条进攻线」「还给我」时使用。"
         ),
         input_schema={
             "type": "object",
             "properties": {
                 "action": {"type": "string",
-                           "description": "claim / status / brief / hold / advance / release"},
+                           "description": "claim / status / brief / hold / advance / "
+                                          "offensive / offensive_stop / release"},
                 "army": {"type": "string", "description": "第9集团军"},
                 "line": {"type": "string",
-                         "description": "要守的地名，逗号隔开（hold 用）"},
+                         "description": "要守的地名，逗号隔开；或写「前线」（hold 用）"},
                 "target": {"type": "string",
-                           "description": "要推的那一格：省号或地名（advance 用，可省略、用 line 也行）"},
+                           "description": "要推的那一格 / 进攻线的目标省：省号或地名"},
+                "units": {"type": "string",
+                          "description": "派哪几个师：番号「第3山地师」/兵种「装甲」/uid「96,97」，"
+                                         "逗号分隔（hold / advance / offensive 用）"},
                 "country": {"type": "string", "description": "玩哪国，平时留空"},
             },
             "required": ["action"],
@@ -2988,10 +3054,10 @@ class HoI4AdvisorPlugin(NekoPluginBase):
     )
     async def entry_take_command(self, action: str = "status", army: str = "",
                                  line: str = "", country: str = "",
-                                 target: str = "", **_):
+                                 target: str = "", units: str = "", **_):
         return Ok(await self.hoi4_take_command(
             action=action, army=army, line=line, country=country,
-            target=target))
+            target=target, units=units))
 
     _trace("3.2 entry_look / entry_take_command 注册完成")
 

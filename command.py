@@ -104,6 +104,92 @@ def _army_key(name: str) -> str:
     return s
 
 
+def load_unit_names(data_dir: Path) -> dict[int, str]:
+    """uid → 存档里的中文番号（第62步兵师）。
+
+    能这么用是因为**存档的 division id 和内存里的 uid 是同一套编号**：
+    1939 德国开局实测两边各 122 个，交集 122，一个不差（`_probe/_p183`）。
+    存档解析出来的番号于是可以直接当句柄，不必再给师另起一套 id。
+
+    没有存档缓存就返回空表——那时只能靠 uid 或编制兵种点名。
+    """
+    try:
+        from . import cache as cache_mod
+        snap = cache_mod.read_cache(data_dir) or {}
+        oob = snap.get("oob") or {}
+    except Exception:  # noqa: BLE001
+        return {}
+    out: dict[int, str] = {}
+    groups = [d for grp in (oob.get("army_groups") or [])
+              for army in (grp.get("armies") or [])
+              for d in (army.get("divisions") or [])]
+    groups += list(oob.get("unassigned") or [])
+    for d in groups:
+        try:
+            out[int(d["id"])] = str(d.get("name") or "")
+        except (KeyError, TypeError, ValueError):
+            continue
+    return out
+
+
+def pick_from(spec: str, units: list[dict],
+              names: dict[int, str]) -> dict:
+    """把她写的「哪几个师」解析成名单里的师。**只解析，不挑选**。
+
+    三种写法都认，逗号分隔、可以混着写：
+
+    | 写法 | 例子 | 匹配方式 |
+    |---|---|---|
+    | 内存 uid | `96, 97` | 精确 |
+    | 中文番号 | `第3山地师` | 子串（番号没记全也能认） |
+    | 编制兵种 | `装甲` / `山地` / `SS` / `摩托化` | 子串匹配编制名 |
+
+    为什么给这么松：**她判断要动哪几个师，代码只负责把她的话翻成地址**。
+    翻不出来要如实报哪个词没认出来，而不是悄悄少动几个师。
+
+    返回 `{"units": [...选中...], "uid": [...], "miss": [...没认出的词...]}`。
+    """
+    def key_of(u: dict) -> int:
+        """师的句柄。分配表带 uid；`livegame.units()` 那份只有 addr，就用 addr 顶。"""
+        v = u.get("uid")
+        if v is None:
+            v = u.get("addr")
+        try:
+            return int(v or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    raw = (spec or "").strip()
+    if not raw:
+        return {"units": list(units),
+                "uid": [key_of(u) for u in units], "miss": []}
+    picked: dict[int, dict] = {}
+    miss: list[str] = []
+    for piece in raw.replace("，", ",").replace("、", ",").split(","):
+        tok = piece.strip()
+        if not tok:
+            continue
+        hit: list[dict] = []
+        if tok.isdigit():
+            want = int(tok)
+            hit = [u for u in units if key_of(u) == want]
+        if not hit:
+            # 不是 uid，或者那个 uid 不在名单里：再按番号/编制子串找一次。
+            # 她写「62」可能是指「第62步兵师」，不该直接报认不出。
+            low = tok.lower()
+            for u in units:
+                nm = names.get(key_of(u)) or ""
+                tpl = str(u.get("template") or "")
+                if low in nm.lower() or low in tpl.lower():
+                    hit.append(u)
+        if not hit:
+            miss.append(tok)
+        for u in hit:
+            picked[key_of(u)] = u
+    return {"units": list(picked.values()),
+            "uid": sorted(picked), "miss": miss}
+
+
 class Commander:
     """指挥权状态 + 集团军名册 + 目标队列。状态落盘，重启不丢「谁在指挥谁」。"""
 
@@ -603,18 +689,33 @@ class Commander:
             })
         return out
 
+    # ── 师的句柄：她怎么点名某一个师 ────────────────
+
+    def unit_names(self) -> dict[int, str]:
+        """uid → 存档里的中文番号。见 `load_unit_names`。"""
+        return load_unit_names(self._dir)
+
+    def pick_units(self, spec: str, units: list[dict]) -> dict:
+        """把她写的「哪几个师」解析成名单里的师。见 `pick_from`。"""
+        return pick_from(spec, units, self.unit_names())
+
     def hold(self, player_addr: int, line_provs: list[int],
              max_units: int = 3, dry_run: bool = True,
-             player_short: str = "") -> dict:
+             player_short: str = "", units: str = "") -> dict:
         """守她点名的那条线（M4'）：**守哪些省她定，怎么摆按引擎规则**。
 
         `line_provs` 是她从简报里挑的省号。代码不替她挑、不替她判断该不该
         守——只检查"够不够得着"，然后按 `_quotas` 的引擎规则把兵摆过去。
+
+        `units` 是**她点名要派去守这条线的那几个师**（见 `pick_units` 的写法）。
+        给了就只动这几个，别处的接管部队一个都不碰——这是"点谁守哪里"的那只手。
+        不给就用全部接管部队（旧行为）。
         """
         if not line_provs:
             raise CommandError("bad_input", "要守的那条线一个省都没有。")
         return self._fill(player_addr, player_short, [int(p) for p in line_provs],
-                          max_units=max_units, dry_run=dry_run, what="守线")
+                          max_units=max_units, dry_run=dry_run, what="守线",
+                          only_units=units)
 
     def front(self, player_addr: int) -> dict:
         """前线省列表（我方控制且挨着交战国）。返回 `{"provs": [...], "why": ...}`。
@@ -653,12 +754,12 @@ class Commander:
             ag.close()
 
     def advance(self, player_addr: int, target: int, max_units: int = 0,
-                dry_run: bool = False, player_short: str = "") -> dict:
+                dry_run: bool = False, player_short: str = "",
+                only_units: str = "") -> dict:
         """**推一格**：让与 target 相邻的我方部队进攻 target。
 
         为什么要有这个原语（0.9.23）：以前只有 `hold`（摆防线）和 `move`（调到某省），
-        没有"进攻"这个动作。于是模型把进攻实现成"把师调到敌方远处的省"，
-        四个毛病全从这一个缺口派生：
+        没有"进攻"这个动作。于是模型把进攻当成调兵使，四个毛病全从这一个缺口派生：
 
         - 只有"没在守线"的师才敢动（守线的师已经挂在线上，再 move 出去线就空了）；
         - 一进攻就把线抽空，因为它的动法就是 move；
@@ -666,9 +767,15 @@ class Commander:
         - 单个师被扔到纵深，后路没人接应。
 
         这里的语义就是人在地图上做的那一下：**从相邻的我方省，往那一格打**。
+
+        `only_units` 给了就是**微操**：只有点名的那个师动，别人一个都不碰。
+        「某个师朝哪一点进攻」是她手里的那只手，怎么用它（几个师、从哪绕、
+        怎么围）是她自己的判断，代码不提供"包抄"这种成品动作。
+
         - 只动与 target 相邻、且站在那儿的我方师；别处的守线部队**一个都不动**；
+        - 出发省各留 1 个守家（只有 1 个师时留不住，就全派出去）；
         - 目标必须与我方相邻（隔一格就打不了，得先推进）；
-        - 报告里同时列出"相邻我方省里哪几个没人"——那是防线的空档，事实给她，要不要补她自己定。
+        - 报告里同时列出"相邻我方省里哪几个没人"——那是防线的空档，事实给她。
         """
         st = self._read_state()
         if not st:
@@ -679,8 +786,21 @@ class Commander:
 
         target = int(target)
         obs = self.observe(player_addr, player_short)
-        units, adj = obs["units"], obs["adj"]
-        mine = [u for u in units if int(u["uid"]) in ids]
+        pool, adj = obs["units"], obs["adj"]
+        mine = [u for u in pool if int(u["uid"]) in ids]
+        miss: list[str] = []
+        picked_uid: list[int] = []
+        if (only_units or "").strip():
+            picked = self.pick_units(only_units, mine)
+            if not picked["units"]:
+                raise CommandError(
+                    "no_such_unit",
+                    f"你说的那几个师我一个都没认出来：「{only_units}」。"
+                    f"可以写番号（第3山地师）、兵种（装甲/山地/SS），或者 uid。",
+                    "报一下简报里那几个师的番号，或者直接说「装甲师」这种兵种。")
+            mine = picked["units"]
+            miss = picked["miss"]
+            picked_uid = picked["uid"]
 
         neighbours = set(adj.get(target) or ())
         if not neighbours:
@@ -725,6 +845,7 @@ class Commander:
         out = {"active": True, "army": st.get("army"), "target": target,
                "from_provs": from_provs, "attackers": len(attackers),
                "kept_home": keep, "idle_neighbours": idle_src,
+               "picked": picked_uid, "miss": miss,
                "moved": 0, "dry_run": dry_run}
         if dry_run:
             out["note"] = (f"要从 {len(from_provs)} 个邻省出 {len(attackers)} 个师推省 "
@@ -743,7 +864,151 @@ class Commander:
             out["note"] += (f"；顺带说一句：挨着 {target} 的我方邻省里还有 "
                             f"{len(nid)} 个没有我们的师（{nid[:8]}），"
                             f"那些口子要不要补你自己定。")
+        if miss:
+            out["note"] += (f"；⚠ 这几个词我没认出对应的师："
+                            f"{'、'.join(miss)}——它们一个都没动。")
         return out
+
+    # ── 进攻线（仿游戏里那条）────────────────────
+
+    def offensive(self, player_addr: int, target: int = 0, units: str = "",
+                  player_short: str = "", stop: bool = False,
+                  step: bool = True) -> dict:
+        """**画一条进攻线**：她给目标 + 指定几个师，这几个师一格一格推过去。
+
+        仿的是游戏里那个动作：在地图上拉一条箭头，指定几支部队，它们就沿着
+        箭头方向一个省一个省地打，**每推一格都留人填线**。
+
+        和 `advance` 的分工：
+        - `advance` 是**一格**：说打哪就打哪，一步一令（微操用它）；
+        - `offensive` 是**一条线**：说去哪，之后每轮自己找"朝目标该打的下一格"，
+          打完再找下一格，直到站在目标上。
+
+        保证填线靠三层：
+        1. 每一步只派**挨着那一格**的指定师（`advance` 的规则）；
+        2. 每个出发省各留 1 个守家；
+        3. **上一格没打下来就不重复下令**——不会把同一批师反复往墙上撞。
+
+        状态存在接管记录里（`plan.offensive`），所以插件重载后线还在。
+        `stop=True` 撤线。
+        """
+        st = self._read_state()
+        if not st:
+            return {"active": False}
+        plan = st.get("plan") or {}
+        cur = dict(plan.get("offensive") or {})
+
+        if stop:
+            plan.pop("offensive", None)
+            st["plan"] = plan
+            self._write_state(st)
+            return {"active": True, "stopped": True,
+                    "note": ("进攻线撤了。已经下出去的令还在走，"
+                             "要停就在地图上点掉，或者跟我说「停手」。")}
+
+        # 设线 / 改线
+        if target or (units or "").strip():
+            obs = self.observe(player_addr, player_short)
+            ids = {int(i) for i in st.get("ids") or []}
+            pool = [u for u in obs["units"] if int(u["uid"]) in ids]
+            spec = (units or "").strip()
+            if spec:
+                picked = self.pick_units(spec, pool)
+                if not picked["units"]:
+                    raise CommandError(
+                        "no_such_unit",
+                        f"你说的那几个师我一个都没认出：「{spec}」。"
+                        f"写番号（第3山地师）、兵种（装甲/山地/SS）或 uid 都行。",
+                        "报一下简报里的番号，或者说「装甲师」这种兵种。")
+                uids = picked["uid"]
+                miss = picked["miss"]
+            else:
+                uids = sorted(ids)
+                miss = []
+            cur = {"target": int(target or cur.get("target") or 0),
+                   "uids": uids, "pending": 0, "step": 0, "log": []}
+            if not cur["target"]:
+                raise CommandError("bad_input",
+                                   "进攻线要有个目标：说一个省号或者地名。")
+            plan["offensive"] = cur
+            st["plan"] = plan
+            self._write_state(st)
+            self._log(f"进攻线：目标 {cur['target']}，{len(uids)} 个师"
+                      + (f"，没认出 {'、'.join(miss)}" if miss else ""))
+
+        if not cur or not cur.get("target"):
+            return {"active": True, "none": True,
+                    "note": "现在没有进攻线。说「朝<某地>画一条进攻线」我就画。"}
+        if not step:
+            return {"active": True, "line": cur, "note": "进攻线在，这次没推。"}
+
+        target_p = int(cur["target"])
+        uids = [int(u) for u in cur.get("uids") or []]
+        obs = self.observe(player_addr, player_short)
+        ids = {int(i) for i in st.get("ids") or []}
+        pool = [u for u in obs["units"] if int(u["uid"]) in ids]
+        mine = [u for u in pool if int(u["uid"]) in set(uids)]
+        if not mine:
+            raise CommandError("no_such_unit",
+                               "进攻线上指定的师一个都不在接管名单里了"
+                               "（被打散、换防，或者交回指挥权了）。")
+
+        # 上一格打下来没？
+        pending = int(cur.get("pending") or 0)
+        if pending:
+            ours_now = self._live.controlled_provs(player_addr, [pending])
+            if pending not in set(ours_now):
+                return {"active": True, "line": cur, "waiting": pending,
+                        "note": (f"进攻线（目标 {target_p}）：上一格 {pending} 还在打，"
+                                 f"没重复下令。打下来我会自己往下一格推。")}
+            cur["log"] = (cur.get("log") or [])[-20:] + [pending]
+            cur["step"] = int(cur.get("step") or 0) + 1
+            cur["pending"] = 0
+
+        starts = sorted({int(u["prov"]) for u in mine})
+        ag = self._live.connect()
+        try:
+            nxt = self._live.next_step_toward(ag, player_addr, starts, target_p)
+        finally:
+            ag.close()
+
+        if not nxt.get("next"):
+            why = nxt.get("why") or ""
+            cur["pending"] = 0
+            plan["offensive"] = cur
+            st["plan"] = plan
+            self._write_state(st)
+            if why == "already_ours":
+                return {"active": True, "line": cur, "done": True,
+                        "note": (f"进攻线（目标 {target_p}）：指定的师已经站在目标上了，"
+                                 f"这轮没别的要打。共推了 {cur.get('step', 0)} 格。")}
+            return {"active": True, "line": cur, "stuck": why,
+                    "note": (f"进攻线（目标 {target_p}）：从现在的出发省算不出通往目标的"
+                             f"陆路（{'找不到路线' if why == 'no_route' else '没有出发省'}）。"
+                             f"要么换个目标，要么先把部队挪到目标附近。")}
+
+        nxt_p = int(nxt["next"])
+        spec = ",".join(str(u) for u in uids)
+        try:
+            r = self.advance(player_addr, nxt_p, 0, False, player_short,
+                             only_units=spec)
+        except CommandError as exc:
+            return {"active": True, "line": cur, "too_far": nxt_p,
+                    "note": (f"进攻线（目标 {target_p}）：朝目标该打的下一格是 {nxt_p}，"
+                             f"但指定的师还挨不着它（{exc.message}）。"
+                             f"要么让他们先挪过去，要么把线画到打得到的地方。")}
+        cur["pending"] = nxt_p
+        cur["log"] = (cur.get("log") or [])[-20:]
+        plan["offensive"] = cur
+        st["plan"] = plan
+        self._write_state(st)
+
+        rest = int(nxt.get("cost") or 0)
+        note = (f"进攻线（目标 {target_p}）：这一步推 {nxt_p}"
+                f"（离目标还有 {rest} 格要打）。{r.get('note') or ''}")
+        return {"active": True, "line": cur, "stepped": nxt_p,
+                "moved": r.get("moved", 0), "note": note,
+                "idle_neighbours": r.get("idle_neighbours") or []}
 
     def _apply(self, player_addr: int, rows: list[dict],
                what: str) -> dict:
@@ -856,13 +1121,16 @@ class Commander:
     def _fill(self, player_addr: int, player_short: str = "",
               front_provs: list[int] | None = None,
               max_units: int = 3, dry_run: bool = False,
-              what: str = "守线") -> dict:
+              what: str = "守线", only_units: str = "") -> dict:
         """把兵补到这条线上 —— **只执行，不做决策**（M4'）。
 
         `front_provs` 是谁给的，决定这是谁的决定：
         - 给了 → **YUI/玩家点名要守的那几个省**，原样用，代码不判断该不该守；
         - 没给 → 兜底的"所有接敌省"（只有内部 dispatch 会这么调）。
         摆法（每省几个师、从哪抽人）按引擎实测规则（`_quotas`），这是执行细节。
+
+        `only_units` 是她点名要动的那几个师（写法人话/番号/兵种皆可）。给了就
+        只在这几个师里摆，别处一个都不碰——"点谁守哪里"靠它。
         """
         st = self._read_state()
         if not st:
@@ -872,6 +1140,20 @@ class Commander:
         addr_short = obs["addr_short"]
         ids = {int(i) for i in st.get("ids") or []}
         mine = set(ids)
+
+        picked: dict = {"units": units, "uid": [], "miss": []}
+        if (only_units or "").strip():
+            picked = self.pick_units(only_units, units)
+            if not picked["units"]:
+                raise CommandError(
+                    "no_such_unit",
+                    f"你说的那几个师我一个都没认出来：「{only_units}」。"
+                    f"可以写番号（第3山地师）、兵种（装甲/山地/SS），或者 uid。",
+                    "报一下简报里那几个师的番号，或者直接说「装甲师」这种兵种。")
+            keep = {int(u["uid"]) for u in picked["units"]}
+            units = picked["units"]
+            ids &= keep
+            mine &= keep
 
         # 冲突检测：师的行军目标被我改过 → 玩家动过 → 让出
         issued = {int(a): int(r["dst"])
@@ -972,6 +1254,11 @@ class Commander:
                     if any(enemy_names and addr_short.get(int(a)) in enemy_names
                            for a in (dist.get(p) or {}))}
         free = []
+        # 她**点名**了要动哪几个师时，不走"只挑空闲的"过滤：那是她一一看过
+        # 才点的，正在行军/正在打也是她的选择。以前一律过滤，真机上就出现
+        # 「点了第3山地师，回一句『手上的师都在路上或正在打，先不动』」——
+        # 用户报的「只会调动空闲部队进攻」正是这个。
+        explicit = bool((only_units or "").strip())
         for u in units:
             p = int(u["prov"])
             # 「在不在行军」要看 **path**，不是 target。
@@ -982,7 +1269,9 @@ class Commander:
             t = int(u["target"] or 0) or (int(route[-1]) if route else 0)
             if t:
                 inbound[t] = inbound.get(t, 0) + 1
-            elif p not in fighting:
+            if explicit and p not in fighting:
+                free.append(u)
+            elif not t and p not in fighting:
                 free.append(u)
             cur[p] = cur.get(p, 0) + 1
 

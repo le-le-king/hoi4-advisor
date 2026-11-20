@@ -50,6 +50,9 @@ class FrontWatch:
         self._waiting_logged = False
         self._errors = 0
         self._ticks = 0
+        # 进攻线卡住的**原因**（不是"卡没卡"）：只在原因变化时记一条日志，
+        # 否则线一直走不动就会每轮刷同一句话。
+        self._line_stuck = ""
         # 0.9.18（M4'）：战况简报推给她的节流状态
         self._last_brief_at = 0.0
         self._last_brief_key = None
@@ -155,6 +158,36 @@ class FrontWatch:
             self._last_ctrl = ctl["prov_ctrl"]
         # 0.9.15：接管了部队就每轮带着它走一步（默认只观察，mode=auto 才派兵）
         self._command_loop(snap, live, player)
+        # 0.10.2：她自己画的那条进攻线，每轮往下推一格。
+        # **线是她画的**（目标 + 派哪几个师都是她定的），这里只是接着执行，
+        # 和 0.9.18 拆掉的那个"哨兵自己决定打哪"不是一回事。
+        self._advance_offensive(player)
+
+    def _advance_offensive(self, player: dict) -> None:
+        """进攻线每轮走一格。上一格没打下来就什么都不做（`offensive` 自己判）。"""
+        try:
+            cmd = self._plugin._commander()
+            st = cmd._read_state()
+            line = ((st or {}).get("plan") or {}).get("offensive") or {}
+            if not line:
+                return
+            r = cmd.offensive(int(player["addr"]), 0, "",
+                              str(player.get("short") or ""), False, True)
+        except Exception as exc:  # noqa: BLE001 推进失败不能拖垮哨兵
+            self._log(f"进攻线推进失败：{type(exc).__name__}: {exc}")
+            return
+        # 只在**真有事发生**的时候记一笔，免得线卡住时每轮刷一条相同的日志
+        if r.get("stepped"):
+            self._log(f"进攻线：推了 {r['stepped']}（{r.get('note', '')[:60]}）")
+        elif r.get("done"):
+            self._log(f"进攻线：{r.get('note', '')[:80]}")
+        elif r.get("stuck"):
+            why = r.get("stuck")
+            if self._line_stuck != why:
+                self._line_stuck = why
+                self._log(f"进攻线走不动了（{why}）：{r.get('note', '')[:80]}")
+        else:
+            self._line_stuck = ""
 
     def _command_loop(self, snap: dict, live: livegame.LiveGame,
                       player: dict) -> None:
