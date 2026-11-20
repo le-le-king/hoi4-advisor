@@ -1591,7 +1591,7 @@ if not mpath.is_dir():
     continue                    # ← 解不到就静默跳过
 ```
 
-插件跑在宿主目录里，于是解到 `<N.E.K.O 安装目录>\mod\yui_command`
+插件跑在宿主目录里，于是解到 `<宿主目录>\mod\yui_command`
 ——不存在，这个 mod 被**静默丢掉**。真机复现：
 
 ```
@@ -1599,7 +1599,7 @@ cwd = <插件开发目录>
   按 cwd 解   = <插件开发目录>\mod\yui_command                      存在
 把 cwd 换成宿主目录（插件真实运行环境）:
   yui_command.mod: path='mod/yui_command'
-    -> <N.E.K.O 安装目录>\mod\yui_command   存在=False
+    -> <宿主目录>\mod\yui_command   存在=False
 ```
 
 修法：相对路径按 `user_dir` 解，并加两条兜底（盘符搬家用"用户目录 + 路径尾部"、

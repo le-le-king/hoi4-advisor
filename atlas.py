@@ -148,7 +148,7 @@ def _resolve_mod_dir(desc: dict, mod_file: Path,
     1. **相对路径按"用户目录"解，不是进程工作目录。**
        `yui_command.mod` 里写的是 `path="mod/yui_command"`（插件自己也这么发），
        Paradox 的惯例是相对 `<用户目录>`。按 cwd 解的话，插件跑在宿主目录里，
-       这个 mod 会被静默丢掉（真机实测：解到 `Q:\\N.E.K.O...\\mod\\yui_command`，
+       这个 mod 会被静默丢掉（真机实测：解到 `<宿主目录>\mod\yui_command`，
        不存在）。
     2. **盘符/目录搬过家**：绝对路径指的盘不在（换个盘装游戏）→ 用
        "用户目录 + 相对尾部" 再试一次。
