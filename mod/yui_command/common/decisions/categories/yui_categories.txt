@@ -1,0 +1,16 @@
+# YUI 参谋 —— 游戏内说明卡片
+#
+# 这个 mod 只做一件事：在决策面板里放一张"怎么用 YUI"的说明卡。
+#
+# 为什么按键和划线不在这里：HOI4 的 mod 脚本没有"按键触发效果"这个接口，
+# gui 里的 shortcut 只对游戏自己认识的按钮名生效。所以 F7/F8 是在游戏进程里
+# 读的（插件里的 neko_hoi4_agent.dll）；划线走的是直接改战区前线对象，
+# 连键都不用按。mod 这边只负责让用户在游戏里能找到"这玩意儿怎么用"。
+
+yui_command = {
+	icon = generic_decision
+	priority = 900
+	visible = {
+		always = yes
+	}
+}

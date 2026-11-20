@@ -1,0 +1,48 @@
+{
+ "exe": "Q:\\BaiduNetdiskDownload\\Hearts of Iron IV\\hoi4.exe",
+ "image_base": 5368709120,
+ "text": [
+  4096,
+  37499328
+ ],
+ "classes": {
+  "CCountry": {
+   "vtable": 38331200
+  },
+  "CNationalFocus": {
+   "vtable": 37693040
+  },
+  "CNationalFocusProgress": {
+   "vtable": 37693368
+  },
+  "CArmy": {
+   "vtable": 39765144
+  },
+  "CProvince": {
+   "vtable": 39743240
+  },
+  "CGameIdler": {
+   "vtable": 37679584,
+   "note": "主vtable；+0x508 是 CSelectionList（静态逆向，待运行时验证）"
+  },
+  "CSelectionList": {
+   "vtable": 37679544,
+   "note": "挂在 CGameIdler+0x508；内部布局待运行时验证"
+  },
+  "CCombatManager": {
+   "vtable": 39738896,
+   "note": "+0x10 是 vec<CLandCombat*>（0.9.1 真机：22 场同时进行）"
+  },
+  "CLandCombat": {
+   "vtable": 39982192,
+   "note": "+0x30/+0x38 两个 CLandCombatant，+0x40 是 CProvince*"
+  }
+ },
+ "build": {
+  "exe_size": 51013240,
+  "hofix": "1.16.9 (baidu)",
+  "rva_new": 31821568,
+  "rva_apply": 12657280,
+  "order_type": 2
+ }
+}

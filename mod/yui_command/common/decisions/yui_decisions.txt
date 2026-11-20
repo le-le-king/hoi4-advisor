@@ -1,0 +1,36 @@
+# YUI 参谋：一张读完就没用的说明卡。
+#
+# 刻意做成"零成本、点一次就消失"：它不该占政治点，也不该每局都跳出来。
+# 真正在干活的是插件（进程内那个 DLL）——它读得到 F7/F8，
+# 也能直接改战区前线的省份范围，不用按任何键。
+
+yui_command = {
+
+	yui_how_to = {
+
+		icon = GFX_decision_generic_decision
+		is_good = yes
+		fire_only_once = yes
+		cost = 0
+
+		allowed = {
+			always = yes
+		}
+
+		visible = {
+			always = yes
+		}
+
+		available = {
+			always = yes
+		}
+
+		# 什么都不做。这张卡是给玩家看的，不是给引擎用的。
+		complete_effect = {
+		}
+
+		ai_will_do = {
+			factor = 0
+		}
+	}
+}

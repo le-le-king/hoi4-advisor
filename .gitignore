@@ -1,0 +1,38 @@
+# ── 运行期数据（每个人机器上都不一样，不进仓库）──
+data/
+config.json
+config.toml
+*.log
+*.log.*
+
+# ── 构建产物 ──
+dist/
+build/
+*.neko-plugin
+
+# ── 编译中间产物 ──
+__pycache__/
+*.py[cod]
+*.pyd
+*.o
+*.obj
+*.exp
+*.lib
+
+# 代理 DLL 的调试符号和逐次重建的旧版本（只保留 dll/ 下那两个固定名）
+*.pdb
+dll/neko_hoi4_agent_r*.dll
+dll/_new/
+dll/_backup*/
+
+# ── 第三方二进制（不进源码仓库，随 Release 包分发）──
+asrlib/
+dll/vendor/
+
+# ── 编辑器 / 系统 ──
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+desktop.ini
+.DS_Store

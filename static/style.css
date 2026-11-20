@@ -1,0 +1,183 @@
+/* 钢四参谋 · 世界资料库引导页
+   风格跟 qqbetter_auto_reply 的引导页保持一致：浅灰底、白卡片、靛蓝主色。 */
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+:root {
+  --bg: #f0f2f5;
+  --card: #ffffff;
+  --ink: #1a1a2e;
+  --muted: #6b7280;
+  --line: #e2e8f0;
+  --accent: #6366f1;
+  --accent-soft: rgba(99, 102, 241, .10);
+  --ok: #22c55e;
+  --warn: #f59e0b;
+  --err: #ef4444;
+}
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Microsoft YaHei', Roboto, sans-serif;
+  background: var(--bg);
+  color: var(--ink);
+  min-height: 100vh;
+  padding: 32px 16px 72px;
+  -webkit-font-smoothing: antialiased;
+}
+
+.shell { max-width: 880px; margin: 0 auto; }
+
+/* ── 顶部 ─────────────────────────────── */
+.head { text-align: center; margin-bottom: 26px; }
+.head h1 { font-size: 22px; letter-spacing: .5px; }
+.head p { color: var(--muted); font-size: 13px; margin-top: 8px; }
+
+/* ── 步骤条 ───────────────────────────── */
+.steps { display: flex; align-items: center; justify-content: center; gap: 6px; margin-bottom: 26px; }
+.step-dot {
+  display: flex; align-items: center; gap: 7px;
+  font-size: 12px; color: var(--muted); padding: 5px 12px; border-radius: 20px;
+  transition: .2s; white-space: nowrap;
+}
+.step-dot b {
+  width: 20px; height: 20px; border-radius: 50%; background: #d7dce5; color: #fff;
+  display: grid; place-items: center; font-size: 11px; font-weight: 600;
+}
+.step-dot.on { background: var(--accent-soft); color: var(--accent); }
+.step-dot.on b { background: var(--accent); }
+.step-dot.done b { background: var(--ok); }
+.step-sep { width: 18px; height: 1px; background: var(--line); }
+
+/* ── 卡片 ─────────────────────────────── */
+.card {
+  background: var(--card); border-radius: 14px; padding: 26px;
+  box-shadow: 0 1px 3px rgba(16, 24, 40, .05), 0 8px 24px -12px rgba(16, 24, 40, .12);
+  margin-bottom: 16px;
+}
+.card h2 { font-size: 16px; margin-bottom: 4px; }
+.card .hint { color: var(--muted); font-size: 12.5px; line-height: 1.75; margin-bottom: 18px; }
+
+/* ── 插画 ─────────────────────────────── */
+.art { display: flex; justify-content: center; margin: 4px 0 18px; }
+.art svg { width: 100%; max-width: 420px; height: auto; }
+
+/* ── 行 / 状态 ────────────────────────── */
+.row { display: flex; gap: 12px; align-items: flex-start; padding: 11px 0; border-top: 1px solid var(--line); }
+.row:first-of-type { border-top: 0; }
+.row .k { color: var(--muted); font-size: 12.5px; width: 96px; flex: none; padding-top: 1px; }
+.row .v { font-size: 13px; word-break: break-all; line-height: 1.6; flex: 1; }
+.mono { font-family: ui-monospace, 'Cascadia Code', Consolas, monospace; font-size: 12px; }
+
+.chip {
+  display: inline-block; padding: 2px 9px; border-radius: 5px;
+  font-size: 11.5px; font-weight: 600; margin: 0 6px 6px 0; background: #eef0f4; color: #475569;
+}
+.chip.ok { background: rgba(34, 197, 94, .12); color: #16a34a; }
+.chip.warn { background: rgba(245, 158, 11, .12); color: #d97706; }
+.chip.off { background: #eef0f4; color: #94a3b8; text-decoration: line-through; }
+
+/* ── 世界卡片 ─────────────────────────── */
+.pick { display: grid; gap: 12px; }
+.opt {
+  border: 2px solid var(--line); border-radius: 12px; padding: 16px 18px;
+  cursor: pointer; transition: .15s; display: flex; justify-content: space-between;
+  align-items: center; gap: 14px;
+}
+.opt:hover { border-color: #c7d2fe; }
+.opt.sel { border-color: var(--accent); background: var(--accent-soft); }
+.opt .t { font-size: 14px; font-weight: 600; margin-bottom: 6px; }
+.opt .m { font-size: 12px; color: var(--muted); line-height: 1.7; }
+.opt .n { display: flex; flex-direction: column; gap: 3px; font-size: 12px; color: var(--muted); text-align: right; flex: none; }
+.opt .n b { color: var(--ink); font-size: 15px; }
+
+/* ── 进度 ─────────────────────────────── */
+.bar { height: 9px; border-radius: 6px; background: #e8ebf1; overflow: hidden; margin: 14px 0 10px; }
+.bar > i { display: block; height: 100%; width: 0; background: linear-gradient(90deg, #818cf8, var(--accent)); transition: width .35s ease; }
+.plog { font-size: 12.5px; color: var(--muted); display: flex; justify-content: space-between; }
+
+/* ── 按钮 ─────────────────────────────── */
+.acts { display: flex; gap: 10px; justify-content: flex-end; margin-top: 20px; flex-wrap: wrap; }
+button {
+  font: inherit; cursor: pointer; border-radius: 9px; padding: 9px 20px;
+  border: 1px solid var(--line); background: #fff; color: var(--ink); font-size: 13.5px;
+  transition: .15s;
+}
+button:hover:not(:disabled) { border-color: #c7d2fe; background: #f8faff; }
+button.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+button.primary:hover:not(:disabled) { background: #4f46e5; border-color: #4f46e5; }
+button.ghost { border-color: transparent; color: var(--muted); }
+button.danger { color: var(--err); }
+button:disabled { opacity: .5; cursor: not-allowed; }
+
+/* ── 提示条 ───────────────────────────── */
+.note {
+  border-radius: 10px; padding: 11px 14px; font-size: 12.5px; line-height: 1.7;
+  margin-top: 14px; background: #f6f8fb; color: #475569;
+}
+.note.warn { background: rgba(245, 158, 11, .09); color: #92400e; }
+.note.err { background: rgba(239, 68, 68, .08); color: #b91c1c; }
+.note ul { margin: 4px 0 0 18px; }
+
+/* ── 世界列表 ─────────────────────────── */
+.wrow {
+  display: flex; justify-content: space-between; align-items: center; gap: 14px;
+  padding: 14px 0; border-top: 1px solid var(--line);
+}
+.wrow:first-of-type { border-top: 0; }
+.wrow .t { font-size: 13.5px; font-weight: 600; }
+.wrow .m { font-size: 12px; color: var(--muted); margin-top: 5px; }
+.wrow .btns { display: flex; gap: 8px; flex: none; }
+.wrow .btns button { padding: 6px 13px; font-size: 12.5px; }
+
+.dot { width: 7px; height: 7px; border-radius: 50%; background: #cbd5e1; display: inline-block; margin-right: 7px; }
+.dot.on { background: var(--ok); box-shadow: 0 0 0 3px rgba(34, 197, 94, .15); }
+
+.hidden { display: none !important; }
+.foot { text-align: center; color: #98a2b3; font-size: 11.5px; margin-top: 22px; }
+
+/* ── 手动指定目录那一行（替代被 iframe 禁掉的 prompt）── */
+.manrow {
+  display: flex;
+  gap: 8px;
+  margin: 12px 0 4px;
+  align-items: stretch;
+}
+.manrow input {
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 9px 12px;
+  border: 1px solid #d7dae0;
+  border-radius: 8px;
+  font-family: ui-monospace, Consolas, monospace;
+  font-size: 13px;
+  background: #fff;
+  color: #1f2430;
+}
+.manrow input:focus {
+  outline: none;
+  border-color: #6366f1;
+  box-shadow: 0 0 0 3px rgba(99, 102, 241, .12);
+}
+.manrow button { flex: 0 0 auto; }
+
+/* ── 页面内提示条（替代被 iframe 禁掉的 alert）── */
+.toast {
+  position: fixed;
+  left: 50%;
+  bottom: 28px;
+  transform: translateX(-50%) translateY(12px);
+  max-width: min(560px, 86vw);
+  padding: 11px 18px;
+  border-radius: 10px;
+  background: #1f2430;
+  color: #fff;
+  font-size: 13.5px;
+  line-height: 1.55;
+  box-shadow: 0 8px 28px rgba(0, 0, 0, .22);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity .18s ease, transform .18s ease;
+  z-index: 99;
+}
+.toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+.toast.err { background: #b42318; }
