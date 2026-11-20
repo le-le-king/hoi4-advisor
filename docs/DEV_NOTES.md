@@ -1595,8 +1595,8 @@ if not mpath.is_dir():
 ——不存在，这个 mod 被**静默丢掉**。真机复现：
 
 ```
-cwd = Q:\neko开发
-  按 cwd 解   = Q:\neko开发\mod\yui_command                      存在
+cwd = <插件开发目录>
+  按 cwd 解   = <插件开发目录>\mod\yui_command                      存在
 把 cwd 换成宿主目录（插件真实运行环境）:
   yui_command.mod: path='mod/yui_command'
     -> <N.E.K.O 安装目录>\mod\yui_command   存在=False
