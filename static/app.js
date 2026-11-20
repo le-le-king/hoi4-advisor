@@ -15,6 +15,11 @@
 
   var S = {
     game: null,       // {dir, version, mods}
+    saves: [],        // 开始页列出来的存档
+    save: '',         // 选中的存档路径
+    selectedSave: -1,
+    startup: null,    // 启动进度
+    ready: false,     // 闸门：四步全绿才 true
     options: [],      // preview 出来的候选世界
     selected: 0,
     build: null,
@@ -80,7 +85,7 @@
 
   // ── 步骤切换 ──────────────────────────
   function go(n) {
-    ['s1', 's2', 's3', 's4', 's5'].forEach(function (id) {
+    ['s0', 's1', 's2', 's3', 's4', 's5'].forEach(function (id) {
       var el = $(id);
       if (el) el.classList.toggle('hidden', Number(id.slice(1)) !== n);
     });
@@ -399,9 +404,156 @@
     $('s5-back').onclick = function () { go(1); };
   }
 
+  // ── 第 0 步：开始（启动闸门）──────────
+  // 用户要的：选存档 → 进度条注入代理 → 全绿才能用。
+  // 这里只负责"选、点、看进度"，重活全在面板后端（后台线程）。
+  function renderSaves() {
+    var box = $('s0-saves');
+    if (!S.saves.length) {
+      box.innerHTML = '<div class="note warn">没找到任何存档。先让游戏存一次档，' +
+                      '或者确认游戏的「存档目录」在哪。</div>';
+      return;
+    }
+    box.innerHTML = S.saves.map(function (s, i) {
+      var meta = s.error ? ('读不了：' + esc(s.error))
+        : (esc(s.player || '?') + ' · ' + esc(s.date_text || '?') +
+           ' · ' + esc(s.version || '?') + ' · ' + s.size_mb + ' MB');
+      return '<div class="opt' + (i === S.selectedSave ? ' sel' : '') +
+        '" data-sv="' + i + '">' +
+        '<div class="t">' + esc(s.name) + '</div>' +
+        '<div class="m">' + meta + '</div></div>';
+    }).join('');
+    Array.prototype.forEach.call(box.querySelectorAll('[data-sv]'), function (el) {
+      el.onclick = function () {
+        S.selectedSave = Number(el.dataset.sv);
+        S.save = S.saves[S.selectedSave].path;
+        $('s0-picked').textContent = S.saves[S.selectedSave].name;
+        $('s0-go').disabled = false;
+        renderSaves();
+      };
+    });
+  }
+
+  async function loadSaves() {
+    $('s0-saves').innerHTML = '<div class="note">正在列存档…</div>';
+    try {
+      var r = await call('startup_saves', { game_dir: (S.game && S.game.dir) || '' });
+      S.saves = r.saves || [];
+      // 默认选最新的那个（列表已按时间倒序），省一次点击
+      if (S.saves.length && S.selectedSave < 0) S.selectedSave = 0;
+      if (S.selectedSave >= 0 && S.saves[S.selectedSave]) {
+        S.save = S.saves[S.selectedSave].path;
+        $('s0-picked').textContent = S.saves[S.selectedSave].name;
+        $('s0-go').disabled = false;
+      }
+      renderSaves();
+    } catch (e) {
+      $('s0-saves').innerHTML = '<div class="note err">列存档失败：' +
+        esc(e.message) + '</div>';
+    }
+  }
+
+  function applyStart(p) {
+    S.startup = p;
+    var wrap = $('s0-bar-wrap');
+    if (!p.running && !p.ready && !p.error) { wrap.classList.add('hidden'); return; }
+    wrap.classList.remove('hidden');
+    $('s0-bar').style.width = Math.max(0, Math.min(100, p.percent || 0)) + '%';
+    $('s0-phase').textContent = (p.phase || '') + '  ' +
+      Math.round(p.percent || 0) + '%';
+    $('s0-steps').innerHTML = (p.steps || []).map(function (s) {
+      return '<li class="' + (s.ok ? 'ok' : 'bad') + '">' +
+        (s.ok ? '✓ ' : '✗ ') + esc(s.name) +
+        (s.note ? ' <span class="mono">' + esc(s.note) + '</span>' : '') + '</li>';
+    }).join('');
+    if (p.error) {
+      $('s0-note').className = 'note err';
+      $('s0-note').innerHTML = '<b>卡住了：</b>' + esc(p.error);
+    } else if (p.ready) {
+      $('s0-note').className = 'note ok';
+      var ws = (p.warnings || []).map(esc).join('<br>');
+      $('s0-note').innerHTML = '<b>接上了。</b> ' + esc(p.save_label || '') +
+        (p.world ? '，世界数据 <span class="mono">' + esc(p.world) + '</span>' : '') +
+        (ws ? '<br><span class="warntext">' + ws + '</span>' : '');
+    } else {
+      $('s0-note').className = 'note';
+      $('s0-note').textContent = '正在启动…（读大存档要 30~60 秒，别关面板）';
+    }
+  }
+
+  async function pollStart() {
+    for (var i = 0; i < 600; i++) {          // 最长约 5 分钟
+      await sleep(500);
+      var p = null;
+      try { p = await call('startup_progress'); } catch (e) { continue; }
+      applyStart(p);
+      if (!p.running) {
+        $('s0-go').disabled = false;
+        if (p.ready) {
+          S.ready = true;
+          // 接上之后把资料库状态也刷一遍，再放她去用
+          await loadSnapshot(undefined, true);
+          $('s0-note').innerHTML += '<br><br><b>现在可以用了。</b>' +
+            '去「我的资料库」看看，或者直接回聊天窗口下令。';
+          // 有资料库就直接给管理页，没有就让她去建一个
+          if (S.worlds.length) { renderWorlds(); go(5); } else { go(1); }
+          return;
+        }
+        return;
+      }
+    }
+    $('s0-note').className = 'note err';
+    $('s0-note').textContent = '等太久了，可能卡住了。';
+  }
+
+  async function startUp() {
+    if (!S.save) return;
+    $('s0-go').disabled = true;
+    $('s0-note').className = 'note';
+    $('s0-note').textContent = '开始启动…';
+    try {
+      await call('startup_run', {
+        save_path: S.save,
+        game_dir: (S.game && S.game.dir) || ''
+      });
+    } catch (e) {
+      $('s0-note').className = 'note err';
+      $('s0-note').textContent = '启动失败：' + e.message;
+      $('s0-go').disabled = false;
+      return;
+    }
+    pollStart();
+  }
+
   // ── 启动 ──────────────────────────────
+  $('s0-go').onclick = function () { startUp(); };
+  $('s0-refresh').onclick = function () { loadSaves(); };
+
+  async function boot() {
+    // 先问闸门：已经接上就直接去资料库，否则停在开始页
+    try {
+      var st = await call('startup_status');
+      S.ready = !!st.ready;
+      if (st.ready) {
+        applyStart(st);
+        await loadSnapshot(undefined, true);
+        if (!S.worlds.length) { renderWorlds(); go(5); }
+        return;
+      }
+      if (st.running) {            // 上次没跑完（面板关了又开）
+        applyStart(st);
+        pollStart();
+      }
+    } catch (e) {
+      // 闸门问不到就当没接上，别把人挡在错误页外面
+    }
+    go(0);
+    await loadSnapshot(undefined, true);   // stay=true：别把开始页顶掉
+    await loadSaves();
+  }
+
   bind();
-  loadSnapshot().catch(function (e) {
+  boot().catch(function (e) {
     renderGame(null);
     $('s1-note').className = 'note err';
     $('s1-note').textContent = '读不到插件状态：' + e.message;

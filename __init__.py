@@ -89,6 +89,9 @@ def llm_tool(**kw):  # noqa: F811 探针期临时替换，定位后删
 def plugin_entry(**kw):  # noqa: F811
     def _deco(fn):
         _trace(f"3.x plugin_entry[{kw.get('id')}] 装饰器进入")
+        eid = str(kw.get("id") or "")
+        if eid and _needs_startup(eid):
+            fn = _gate(fn, eid)
         try:
             out = _plugin_entry_raw(**kw)(fn)
         except BaseException as exc:  # noqa: BLE001
@@ -98,6 +101,55 @@ def plugin_entry(**kw):  # noqa: F811
         _trace(f"3.x plugin_entry[{kw.get('id')}] 注册成功")
         return out
     return _deco
+
+
+# ── 启动闸门 ─────────────────────────────────────────────────────
+# 用户要的：面板里选存档 → 进度条注入代理 → **全部成功才能用**。
+# 面板自己的入口（世界资料库/开始页）和体检不受限制，否则接不上就没法自救。
+
+_GATE_EXEMPT_PREFIX = ("world_", "startup_", "panel_", "hoi4_panel")
+_GATE_EXEMPT = {"hoi4_health", "hoi4_voice", "hoi4_link", "hoi4_refresh"}
+
+
+def _needs_startup(entry_id: str) -> bool:
+    if entry_id in _GATE_EXEMPT:
+        return False
+    return not entry_id.startswith(_GATE_EXEMPT_PREFIX)
+
+
+def _startup_ready() -> bool:
+    """问面板那边接没接上。问不到就当没接上——宁可挡一下，不放它去动部队。"""
+    try:
+        from . import panel as _p
+        return bool(_p.startup_ready())
+    except Exception:  # noqa: BLE001
+        return False
+
+
+_GATE_TEXT = (
+    "还没接上这局游戏。打开插件面板的「开始」页：选一个存档 → 点「开始启动」→ "
+    "等进度条走完（读大存档要 30~60 秒）。四步全绿之前我不会动你的部队。"
+)
+
+
+def _gate(fn, entry_id: str):
+    """给入口套一层闸门。异步和同步都支持。"""
+    import asyncio as _aio
+
+    if _aio.iscoroutinefunction(fn):
+        @_ft_probe.wraps(fn)
+        async def _agate(*a, **k):
+            if not _startup_ready():
+                raise UiError(_GATE_TEXT)
+            return await fn(*a, **k)
+        return _agate
+
+    @_ft_probe.wraps(fn)
+    def _sgate(*a, **k):
+        if not _startup_ready():
+            raise UiError(_GATE_TEXT)
+        return fn(*a, **k)
+    return _sgate
 
 from . import act_log, actions, cache as cache_mod, config, logs, render, save_meta
 from . import livegame, mapops, nekoagent, places as places_mod, prov_index, screen
@@ -4069,6 +4121,67 @@ class HoI4AdvisorPlugin(NekoPluginBase):
         return Ok(await asyncio.to_thread(
             panel_mod.start_build, _s(game_dir).strip(), mod_indexes,
             [str(x) for x in mod_names] if mod_names else None))
+
+    _trace("3.9c4b startup_status 装饰前")
+    @plugin_entry(
+        id="startup_status",
+        name="启动闸门状态",
+        description="给面板用：这局游戏接上没有（选存档 → 注入代理 → 读档 → 核世界）。"
+                    "没接上之前活体工具一律拒绝执行。",
+        input_schema={"type": "object", "properties": {},
+                      "additionalProperties": False},
+    )
+    async def entry_startup_status(self, **_):
+        return Ok(panel_mod.startup_status())
+
+    _trace("3.9c4c startup_saves 装饰前")
+    @plugin_entry(
+        id="startup_saves",
+        name="列存档",
+        description="给面板用：列出能读的存档（日期/玩家/版本/大小），供开始页挑选。",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "game_dir": {"type": "string",
+                             "description": "游戏目录，省略就自动找"},
+            },
+            "additionalProperties": False,
+        },
+    )
+    async def entry_startup_saves(self, game_dir: str = "", **_):
+        return Ok(await asyncio.to_thread(
+            panel_mod.startup_saves, _s(game_dir).strip()))
+
+    _trace("3.9c4d startup_run 装饰前")
+    @plugin_entry(
+        id="startup_run",
+        name="开始启动",
+        description="给面板用：按选定的存档跑一次完整启动（找游戏 → 注入代理 → "
+                    "校验存档 → 核世界）。后台线程跑，用 startup_progress 看进度。",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "save_path": {"type": "string", "description": "存档完整路径"},
+                "game_dir": {"type": "string", "description": "游戏目录，省略就自动找"},
+            },
+            "required": ["save_path"],
+            "additionalProperties": False,
+        },
+    )
+    async def entry_startup_run(self, save_path: str, game_dir: str = "", **_):
+        return Ok(panel_mod.startup_run(_s(save_path).strip(),
+                                        _s(game_dir).strip()))
+
+    _trace("3.9c4e startup_progress 装饰前")
+    @plugin_entry(
+        id="startup_progress",
+        name="启动进度",
+        description="给面板用：查启动到哪一步了（percent/phase/steps/error）。",
+        input_schema={"type": "object", "properties": {},
+                      "additionalProperties": False},
+    )
+    async def entry_startup_progress(self, **_):
+        return Ok(panel_mod.startup_progress())
 
     _trace("3.9c4 world_progress 装饰前")
     @plugin_entry(

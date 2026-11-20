@@ -22,7 +22,7 @@ import threading
 import time
 from pathlib import Path
 
-from . import atlas, config
+from . import atlas, config, save_meta
 
 __all__ = [
     "current_world_id",
@@ -34,6 +34,12 @@ __all__ = [
     "set_current",
     "snapshot",
     "start_build",
+    "startup_progress",
+    "startup_ready",
+    "startup_reset",
+    "startup_run",
+    "startup_saves",
+    "startup_status",
     "switch_world",
     "world_root",
 ]
@@ -487,3 +493,348 @@ def snapshot(game_dir_override: str = "") -> dict:
         "build": progress(),
         "atlas_dir": str(world_root()),
     }
+
+
+# ──────────────────────── 开始引导（启动闸门） ────────────────────────
+#
+# 用户要的流程：**开游戏 → 面板里选读哪个存档 → 进度条注入代理 → 全绿才能用**。
+#
+# 为什么要有这个闸门：以前第一次用的时候各步散着来——先要体检看代理注没注，
+# 再去选存档，再去建世界，任何一步失败都只在某个工具里冒一句，用户根本不知道
+# "我现在到底能不能用"。这里把四件事串成一次带进度的启动，**没跑完就不让用**。
+#
+# PRC_2020（TFR 那局）实测：存档 116 MB，全量解析 33 秒 —— 这种长度放进工具里
+# 必然撞穿宿主 30 秒看门狗。所以启动流程跑在后台线程，前端轮询进度，
+# 不在任何一次工具调用里做重活。
+
+_STARTUP: dict = {
+    "running": False,
+    "ok": False,
+    "ready": False,
+    "percent": 0.0,
+    "phase": "",
+    "steps": [],          # [{name, ok, note}] 已完成的步骤
+    "error": "",
+    "save": "",
+    "save_label": "",
+    "game_dir": "",
+    "world": "",
+    "agent": "",
+    "warnings": [],
+    "started": 0.0,
+    "finished": 0.0,
+}
+_START_LOCK = threading.Lock()
+_START_FILE = "startup.json"
+
+
+def _startup_path() -> Path:
+    return config.data_dir() / _START_FILE
+
+
+def _startup_set(**kw) -> None:
+    with _START_LOCK:
+        _STARTUP.update(kw)
+
+
+def _startup_step(name: str, ok: bool, note: str = "") -> None:
+    with _START_LOCK:
+        _STARTUP["steps"] = list(_STARTUP.get("steps") or []) + [
+            {"name": name, "ok": bool(ok), "note": str(note or "")}]
+
+
+def startup_ready() -> bool:
+    """**门禁**：只有一次完整成功的启动之后才允许用工具。
+
+    从磁盘读：插件重载后闸门状态得还在，否则用户刚启动完、一重载又要重来。
+    """
+    with _START_LOCK:
+        if _STARTUP.get("ready"):
+            return True
+    try:
+        raw = json.loads(_startup_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return bool(raw.get("ready"))
+
+
+def startup_status() -> dict:
+    """当前闸门状态。前端每次进来先问这个，决定是显示引导还是直接用。"""
+    with _START_LOCK:
+        cur = dict(_STARTUP)
+    try:
+        saved = json.loads(_startup_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        saved = {}
+    if not cur.get("ready") and saved.get("ready"):
+        # 磁盘上有"已完成"的记录，但内存里没有（刚重载）——以磁盘为准，
+        # 顺手把内存补上，免得面板显示"未就绪"却能用。
+        with _START_LOCK:
+            _STARTUP.update({
+                "ready": True, "ok": True, "percent": 100.0, "phase": "就绪",
+                "save": saved.get("save", ""),
+                "save_label": saved.get("save_label", ""),
+                "game_dir": saved.get("game_dir", ""),
+                "world": saved.get("world", ""),
+                "agent": saved.get("agent", ""),
+            })
+            cur = dict(_STARTUP)
+    return {
+        "ok": True,
+        "ready": bool(cur.get("ready")),
+        "running": bool(cur.get("running")),
+        "percent": float(cur.get("percent") or 0.0),
+        "phase": cur.get("phase") or "",
+        "steps": cur.get("steps") or [],
+        "error": cur.get("error") or "",
+        "save": cur.get("save") or "",
+        "save_label": cur.get("save_label") or "",
+        "game_dir": cur.get("game_dir") or "",
+        "world": cur.get("world") or "",
+        "agent": cur.get("agent") or "",
+        "warnings": cur.get("warnings") or [],
+    }
+
+
+def startup_saves(game_dir: str = "", limit: int = 40) -> dict:
+    """列出能读的存档，给引导页挑。
+
+    每一项都带**够不够用来判断**的字段：日期、玩家、版本、大小、是不是二进制、
+    以及它大致属于哪个世界（按启用 mod 猜）。
+    """
+    dirs: list[Path] = []
+    try:
+        if game_dir:
+            from . import atlas as _atlas
+            u = _atlas.game_user_dir(Path(game_dir))
+            if u is not None:
+                dirs.append(Path(u) / "save games")
+        if not dirs:
+            dirs = list(config.detect_save_dirs())
+    except Exception:  # noqa: BLE001
+        dirs = []
+
+    out: list[dict] = []
+    for d in dirs:
+        if not Path(d).is_dir():
+            continue
+        for f in sorted(Path(d).glob("*.hoi4"), key=lambda p: -p.stat().st_mtime):
+            if len(out) >= int(limit):
+                break
+            try:
+                h = save_meta.head_meta(f)
+                st = f.stat()
+            except Exception as exc:  # noqa: BLE001 单个档坏了不能拖垮列表
+                out.append({"path": str(f), "name": f.name, "error":
+                            f"{type(exc).__name__}: {exc}"})
+                continue
+            out.append({
+                "path": str(f),
+                "name": f.name,
+                "dir": str(d),
+                "player": h.get("player") or "",
+                "date_text": h.get("date_text") or "",
+                "version": h.get("version_num") or "",
+                "format": h.get("format") or "",
+                "size_mb": round(st.st_size / 1024 / 1024, 1),
+                "mtime": st.st_mtime,
+                "error": "",
+            })
+    out.sort(key=lambda x: -(x.get("mtime") or 0))
+    return {"ok": True, "saves": out[: int(limit)],
+            "current": (current_world_id() or "")}
+
+
+def startup_run(save_path: str, game_dir: str = "") -> dict:
+    """开始一次启动流程（后台线程跑，立刻返回）。"""
+    with _START_LOCK:
+        if _STARTUP.get("running"):
+            return {"ok": False, "error": "上一次启动还没跑完"}
+        _STARTUP.update({
+            "running": True, "ok": False, "ready": False, "percent": 0.0,
+            "phase": "准备", "steps": [], "error": "", "warnings": [],
+            "save": str(save_path or ""), "save_label": "",
+            "game_dir": str(game_dir or ""), "world": "", "agent": "",
+            "started": time.time(), "finished": 0.0,
+        })
+    threading.Thread(target=_startup_runner,
+                     args=(str(save_path or ""), str(game_dir or "")),
+                     name="hoi4-startup", daemon=True).start()
+    return {"ok": True, "started": True}
+
+
+def _startup_runner(save_path: str, game_dir: str) -> None:
+    """四步：找游戏 → 注入代理 → 校验存档 → 对上世界。任一步失败就停。"""
+    def bad(phase: str, msg: str) -> None:
+        _startup_set(running=False, ok=False, ready=False, phase=phase,
+                     error=msg, finished=time.time())
+
+    try:
+        # ── 1. 游戏目录 ──
+        _startup_set(percent=4.0, phase="找游戏目录")
+        game = Path(game_dir) if game_dir else None
+        if game is None or not game.is_dir():
+            try:
+                dirs = list(config.detect_game_dirs())
+            except Exception:  # noqa: BLE001
+                dirs = []
+            game = dirs[0] if dirs else None
+        if game is None or not game.is_dir():
+            _startup_step("找游戏目录", False, "没找到")
+            return bad("找游戏目录", "没找到游戏目录。点「手动指定」选到 Hearts of Iron IV 那一层。")
+        _startup_set(game_dir=str(game), percent=10.0)
+        _startup_step("找游戏目录", True, str(game))
+
+        # ── 2. 游戏进程 ──
+        _startup_set(percent=16.0, phase="等游戏进程")
+        try:
+            proc = save_meta.game_process_cached()
+        except Exception:  # noqa: BLE001
+            proc = {}
+        if not (proc or {}).get("running"):
+            _startup_step("等游戏进程", False, "hoi4.exe 没在跑")
+            return bad("等游戏进程",
+                       "游戏没开（或者还在启动画面）。先把游戏开到地图界面，再点重试。")
+        _startup_step("等游戏进程", True,
+                      f"pid={proc.get('pid')} 启动于 {proc.get('started_at_text') or ''}")
+
+        # ── 3. 版本 / 偏移 ──
+        _startup_set(percent=26.0, phase="校验版本偏移")
+        try:
+            from . import livegame as _lg
+            lg = _lg.LiveGame(config.data_dir(), log=lambda m: None)
+            build = lg._build()               # noqa: SLF001 偏移表自检
+            ver = config.game_dir_version(game)
+            _startup_step("校验版本偏移", True,
+                          f"游戏 {ver}，order_type={build.get('order_type')}")
+        except Exception as exc:  # noqa: BLE001
+            _startup_step("校验版本偏移", False, f"{type(exc).__name__}: {exc}")
+            return bad("校验版本偏移",
+                       f"偏移对不上（{type(exc).__name__}: {exc}）。"
+                       f"多半是游戏版本和我这套偏移不一致，只能看不能动。")
+        _startup_set(percent=36.0)
+
+        # ── 4. 注入代理 ──
+        _startup_set(percent=44.0, phase="注入代理")
+        try:
+            from . import nekoagent as _na
+            ag = _na.ensure(wait=25.0)
+            try:
+                pong = ag.ping() if hasattr(ag, "ping") else ""
+            finally:
+                try:
+                    ag.close()
+                except Exception:  # noqa: BLE001
+                    pass
+            _startup_set(percent=58.0, agent=(pong or "已注入"))
+            _startup_step("注入代理", True, pong or "已注入")
+        except Exception as exc:  # noqa: BLE001
+            _startup_step("注入代理", False, f"{type(exc).__name__}: {exc}")
+            return bad("注入代理",
+                       f"代理注不进去（{type(exc).__name__}: {exc}）。"
+                       f"杀毒软件可能拦了 DLL；看插件日志里「注入」那几行。")
+
+        # ── 5. 校验存档 ──
+        _startup_set(percent=66.0, phase="校验存档")
+        sp = Path(save_path) if save_path else None
+        if sp is None or not sp.is_file():
+            _startup_step("校验存档", False, "没选存档")
+            return bad("校验存档", "还没选存档。在上面的列表里点一个。")
+        try:
+            head = save_meta.head_meta(sp)
+        except Exception as exc:  # noqa: BLE001
+            _startup_step("校验存档", False, f"{type(exc).__name__}: {exc}")
+            return bad("校验存档", f"这个档读不了（{type(exc).__name__}: {exc}）。")
+        if (head.get("format") or "") == "binary":
+            _startup_step("校验存档", False, "二进制档")
+            return bad("校验存档",
+                       "这是二进制存档，插件解析不了。在游戏设置里把「压缩存档」"
+                       "关掉，然后重新存一次。")
+        _startup_set(
+            percent=82.0,
+            save=str(sp),
+            save_label=f"{head.get('player') or '?'} · "
+                       f"{head.get('date_text') or head.get('date') or '?'}",
+        )
+        _startup_step("校验存档", True,
+                      f"{head.get('player')} {head.get('date_text')}")
+
+        # ── 6. 世界数据要跟当前 mod 集合对得上 ──
+        _startup_set(percent=88.0, phase="核对世界数据")
+        warns: list[str] = []
+        cur = current_world_id()
+        meta = {}
+        try:
+            if cur:
+                meta = read_world_meta(world_root() / cur) or {}
+        except Exception:  # noqa: BLE001
+            meta = {}
+        want_mods: set[str] = set()
+        try:
+            from . import atlas as _atlas2
+            want_mods = {m.name for m in _atlas2.discover_mods(game)}
+        except Exception:  # noqa: BLE001
+            want_mods = set()
+        have_mods = set()
+        try:
+            have_mods = {str((m or {}).get("name") or "")
+                         for m in (meta.get("mods") or [])}
+        except Exception:  # noqa: BLE001
+            have_mods = set()
+        if not cur:
+            warns.append("还没有任何世界数据 —— 到「世界资料库」页读一份，"
+                         "否则地名/邻接会退回原版快照。")
+            _startup_step("核对世界数据", False, "没有世界数据")
+        elif want_mods - have_mods:
+            miss = "、".join(sorted(x for x in (want_mods - have_mods) if x))
+            warns.append(f"当前世界（{cur}）没包含这些启用的 mod：{miss}。"
+                         f"到「世界资料库」页按当前 mod 重建一份。")
+            _startup_step("核对世界数据", False, f"缺 mod：{miss}")
+        else:
+            _startup_step("核对世界数据", True,
+                          f"{cur}（{meta.get('provinces')} 省）")
+
+        # ── 7. 就绪 ──
+        _startup_set(percent=100.0, phase="就绪", running=False, ok=True,
+                     ready=True, world=cur or "", warnings=warns,
+                     finished=time.time())
+        try:
+            _startup_path().parent.mkdir(parents=True, exist_ok=True)
+            _startup_path().write_text(json.dumps({
+                "ready": True, "save": str(sp),
+                "save_label": _STARTUP.get("save_label") or "",
+                "game_dir": str(game), "world": cur or "",
+                "agent": _STARTUP.get("agent") or "",
+                "at": time.time(),
+            }, ensure_ascii=False), encoding="utf-8")
+        except Exception:  # noqa: BLE001 落盘失败不影响本次使用
+            pass
+    except Exception as exc:  # noqa: BLE001 兜底：后台线程不能静默死
+        import traceback as _tb
+        _startup_set(running=False, ok=False, ready=False, phase="失败",
+                     error=f"{type(exc).__name__}: {exc}",
+                     finished=time.time())
+        _startup_step("未预期错误", False, f"{type(exc).__name__}: {exc}")
+        print("[startup]", _tb.format_exc())
+
+
+def startup_progress() -> dict:
+    with _START_LOCK:
+        return dict(_STARTUP)
+
+
+def startup_reset() -> dict:
+    """把闸门关掉（换游戏/换存档时用）。"""
+    with _START_LOCK:
+        if _STARTUP.get("running"):
+            return {"ok": False, "error": "正在启动中，等它跑完"}
+        _STARTUP.update({
+            "running": False, "ok": False, "ready": False, "percent": 0.0,
+            "phase": "", "steps": [], "error": "", "save": "",
+            "save_label": "", "world": "", "agent": "", "warnings": [],
+        })
+    try:
+        _startup_path().unlink()
+    except OSError:
+        pass
+    return {"ok": True, "reset": True}

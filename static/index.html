@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>世界资料库 · 钢四参谋</title>
-<link rel="stylesheet" href="style.css?v=3">
+<link rel="stylesheet" href="style.css?v=4">
 </head>
 <body>
 <div class="shell">
@@ -15,7 +15,9 @@
   </div>
 
   <div class="steps" id="steps">
-    <div class="step-dot on" data-s="1"><b>1</b>找到游戏</div>
+    <div class="step-dot on" data-s="0"><b>0</b>开始</div>
+    <i class="step-sep"></i>
+    <div class="step-dot" data-s="1"><b>1</b>找到游戏</div>
     <i class="step-sep"></i>
     <div class="step-dot" data-s="2"><b>2</b>选世界</div>
     <i class="step-sep"></i>
@@ -23,6 +25,33 @@
     <i class="step-sep"></i>
     <div class="step-dot" data-s="4"><b>4</b>完成</div>
   </div>
+
+  <!-- ══════════ 第 0 步：开始（启动闸门） ══════════ -->
+  <section class="card" id="s0">
+    <h2>先让我接上这局游戏</h2>
+    <p class="hint">选一个存档 → 我把代理注进游戏 → 把存档读进来 → 核对世界数据。
+      <b>四步全部成功才算接上</b>，没接上之前工具不会动你的部队。</p>
+
+    <div class="row"><span class="k">游戏</span><span class="v" id="s0-game">正在找…</span></div>
+    <div class="row"><span class="k">存档</span><span class="v" id="s0-picked">还没选</span></div>
+
+    <div class="pick" id="s0-saves" style="margin-top:14px">
+      <div class="note">正在列存档…</div>
+    </div>
+
+    <div id="s0-bar-wrap" class="hidden" style="margin-top:16px">
+      <div class="bar"><i id="s0-bar"></i></div>
+      <div class="plog"><span id="s0-phase">准备</span></div>
+      <ul class="donelist" id="s0-steps"></ul>
+    </div>
+
+    <div class="note" id="s0-note"></div>
+
+    <div class="acts">
+      <button id="s0-refresh">刷新存档列表</button>
+      <button id="s0-go" class="primary" disabled>开始启动</button>
+    </div>
+  </section>
 
   <!-- ══════════ 第 1 步：找到游戏 ══════════ -->
   <section class="card" id="s1">
