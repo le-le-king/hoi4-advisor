@@ -33,9 +33,8 @@ from hoi4_advisor import command, config, livegame  # noqa: E402
 
 try:
     DATA = Path(config.data_dir())
-except Exception:  # noqa: BLE001 拿不到就用默认位置
-    DATA = Path(r"<N.E.K.O 安装目录>\.neko-plugin-installations"
-                r"\plugins\hoi4_advisor\data")
+except Exception:  # noqa: BLE001 拿不到就按脚本位置推（插件目录/data）
+    DATA = Path(__file__).resolve().parent.parent / "data"
 ROUNDS = int(sys.argv[1]) if len(sys.argv) > 1 else 6
 WAIT = float(sys.argv[2]) if len(sys.argv) > 2 else 60.0
 
