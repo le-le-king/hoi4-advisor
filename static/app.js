@@ -19,7 +19,9 @@
     selected: 0,
     build: null,
     worlds: [],
-    current: ''
+    current: '',
+    modsAll: [],      // 全量 mod 清单（含启动器没启用的），给勾选用
+    skipped: []       // 启用了但读不进来的 mod（要如实显示）
   };
 
   // ── 小工具 ────────────────────────────
@@ -140,11 +142,46 @@
     try {
       var r = await call('world_preview', { game_dir: S.game.dir });
       S.options = r.options || [];
+      S.modsAll = r.all_mods || [];
+      S.skipped = r.skipped || [];
       S.selected = Math.max(0, S.options.length - 1);   // 默认选「带 mod」那份
       renderOptions();
+      renderModPicker();
     } catch (e) {
       $('s2-list').innerHTML = '<div class="note err">清点失败：' + esc(e.message) + '</div>';
     }
+  }
+
+  // 全量 mod 勾选：想读启动器里没启用的 mod（给 TFR 单独建一份数据）用这里
+  function renderModPicker() {
+    var wrap = $('s2-pickwrap'), box = $('s2-mods'), note = $('s2-picknote');
+    if (!wrap || !box) return;
+    if (!S.modsAll.length) { wrap.classList.add('hidden'); return; }
+    wrap.classList.remove('hidden');
+    box.innerHTML = S.modsAll.map(function (m, i) {
+      return '<label class="opt" style="display:flex;gap:8px;align-items:center">' +
+        '<input type="checkbox" data-mi="' + i + '"' + (m.enabled ? ' checked' : '') + '>' +
+        '<span>' + esc(m.name) + (m.enabled ? ' <b>（启动器里已启用）</b>' : '') +
+        '</span></label>';
+    }).join('');
+    var bits = [];
+    if (S.skipped.length) {
+      bits.push('⚠ 有 ' + S.skipped.length + ' 个启用的 mod 读不进来：' +
+        S.skipped.map(function (s) { return esc(s.name) + '（' + esc(s.reason) + '）'; }).join('；'));
+    }
+    note.innerHTML = bits.join('<br>');
+    note.className = bits.length ? 'note err' : 'note hidden';
+  }
+
+  function pickedModNames() {
+    var out = [];
+    document.querySelectorAll('#s2-mods input[data-mi]').forEach(function (el) {
+      if (el.checked) {
+        var m = S.modsAll[parseInt(el.getAttribute('data-mi'), 10)];
+        if (m) out.push(m.name);
+      }
+    });
+    return out;
   }
 
   function renderOptions() {
@@ -318,6 +355,30 @@
       loadPreview();
     };
     $('s2-back').onclick = function () { go(1); };
+    var startBuild = async function (payload) {
+      $('s3-fill').style.width = '0%';
+      $('s3-pct').textContent = '0%';
+      $('s3-phase').textContent = '准备中…';
+      $('s3-log').className = 'note';
+      $('s3-log').textContent = '读地图是这次最慢的一步，扫完就快了。';
+      $('s3-back').disabled = true;
+      await call('world_build', payload);
+      go(3);
+      pollBuild();
+    };
+    if ($('s2-pickbuild')) {
+      $('s2-pickbuild').onclick = async function () {
+        var names = pickedModNames();
+        $('s2-pickbuild').disabled = true;
+        try {
+          // 一个都不勾就是读原版——这也是一种合法选择，别拦
+          await startBuild({ game_dir: S.game.dir, mod_names: names });
+        } catch (e) {
+          toast('启动失败：' + e.message, 'err');
+        }
+        $('s2-pickbuild').disabled = false;
+      };
+    }
     $('s2-build').onclick = async function () {
       var opt = S.options[S.selected];
       if (!opt) return;
@@ -325,15 +386,7 @@
       $('s2-build').disabled = true;
       try {
         var mods = (opt.mods || []).map(function (_, i) { return i + 1; });
-        await call('world_build', { game_dir: S.game.dir, mod_indexes: mods });
-        $('s3-fill').style.width = '0%';
-        $('s3-pct').textContent = '0%';
-        $('s3-phase').textContent = '准备中…';
-        $('s3-log').className = 'note';
-        $('s3-log').textContent = '读地图是这次最慢的一步，扫完就快了。';
-        $('s3-back').disabled = true;
-        go(3);
-        pollBuild();
+        await startBuild({ game_dir: S.game.dir, mod_indexes: mods });
       } catch (e) {
         toast('启动失败：' + e.message, 'err');
       }

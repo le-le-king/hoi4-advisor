@@ -45,11 +45,15 @@ from pathlib import Path
 __all__ = [
     "ModInfo",
     "WorldFiles",
+    "all_mods",
     "build_world",
     "discover_mods",
+    "discover_mods_report",
     "game_user_dir",
     "list_worlds",
     "load_world",
+    "mod_from_descriptor",
+    "mods_by_names",
     "read_world_meta",
     "world_fingerprint",
     "write_world",
@@ -84,17 +88,21 @@ _RE_VP = re.compile(r"^VICTORY_POINTS_(\d+)$")
 
 @dataclass
 class ModInfo:
-    """一个启用的 mod。"""
+    """一个读得到的 mod。"""
 
     name: str
     version: str
     path: Path
     mod_file: Path
     replace_paths: list[str] = field(default_factory=list)
+    enabled: bool = True          # 启动器当前启用的；all_mods() 里会有 False 的
+    remote_file_id: str = ""      # 创意工坊 id，报错和兜底找目录时用得上
 
     def as_dict(self) -> dict:
         return {"name": self.name, "version": self.version,
-                "path": str(self.path), "replace_paths": self.replace_paths}
+                "path": str(self.path), "replace_paths": self.replace_paths,
+                "enabled": self.enabled, "mod_file": str(self.mod_file),
+                "remote_file_id": self.remote_file_id}
 
 
 def game_user_dir(game_dir: Path) -> Path | None:
@@ -131,13 +139,62 @@ def _parse_mod_descriptor(path: Path) -> dict:
     return out
 
 
-def mod_from_descriptor(mod_file: Path) -> ModInfo | None:
+def _resolve_mod_dir(desc: dict, mod_file: Path,
+                     user_dir: Path | None) -> tuple[Path | None, str]:
+    """把 `.mod` 里的 `path=` 解成一个真实存在的目录。返回 (目录, 失败原因)。
+
+    三个坑，都真机上踩过：
+
+    1. **相对路径按"用户目录"解，不是进程工作目录。**
+       `yui_command.mod` 里写的是 `path="mod/yui_command"`（插件自己也这么发），
+       Paradox 的惯例是相对 `<用户目录>`。按 cwd 解的话，插件跑在宿主目录里，
+       这个 mod 会被静默丢掉（真机实测：解到 `Q:\\N.E.K.O...\\mod\\yui_command`，
+       不存在）。
+    2. **盘符/目录搬过家**：绝对路径指的盘不在（换个盘装游戏）→ 用
+       "用户目录 + 相对尾部" 再试一次。
+    3. 目录名就是 `.mod` 同名（没有 `path=` 时的惯例）。
+    """
+    raw = (desc.get("path") or "").strip()
+    cands: list[Path] = []
+    if raw:
+        p = Path(raw.replace("\\", "/"))
+        if p.is_absolute():
+            cands.append(p)
+            # 换盘兜底：`D:/Games/HOI4/mod/xxx` → 保留 `mod/xxx` 接到用户目录下
+            parts = p.parts
+            if len(parts) > 2:
+                cands.append((user_dir / Path(*parts[-2:]))
+                             if user_dir else Path(*parts[-2:]))
+            cands.append((user_dir / "mod" / p.name) if user_dir else p)
+        else:
+            if user_dir:
+                cands.append(user_dir / p)
+            cands.append(mod_file.parent / p)
+    cands.append(mod_file.with_suffix(""))
+    if user_dir:
+        cands.append(user_dir / "mod" / mod_file.stem)
+    if user_dir:
+        cands.append(user_dir)
+    for c in cands:
+        try:
+            if c.is_dir():
+                return c, ""
+        except OSError:
+            continue
+    return None, (f"path= 指的目录找不到：{raw!r}" if raw
+                  else "没写 path=，也没有同名目录")
+
+
+def mod_from_descriptor(mod_file: Path,
+                        user_dir: Path | None = None) -> ModInfo | None:
     """从一个 `.mod` 文件建 ModInfo。给「手动指定某个 mod」和探针用。"""
     mod_file = Path(mod_file)
     desc = _parse_mod_descriptor(mod_file) if mod_file.is_file() else {}
-    raw = desc.get("path") or ""
-    mpath = Path(raw) if raw else mod_file.with_suffix("")
-    if not mpath.is_dir():
+    if user_dir is None:
+        # `.mod` 惯例放在 `<用户目录>/mod/` 下
+        user_dir = mod_file.parent.parent if mod_file.parent.name == "mod" else None
+    mpath, _why = _resolve_mod_dir(desc, mod_file, user_dir)
+    if mpath is None:
         return None
     return ModInfo(
         name=desc.get("name") or mpath.name,
@@ -145,47 +202,136 @@ def mod_from_descriptor(mod_file: Path) -> ModInfo | None:
         path=mpath,
         mod_file=mod_file,
         replace_paths=list(desc.get("replace_path") or []),
+        remote_file_id=str(desc.get("remote_file_id") or ""),
     )
 
 
-def discover_mods(game_dir: Path) -> list[ModInfo]:
-    """按 `dlc_load.json` 里启用的顺序返回 mod 列表（后加载的排在后面）。"""
-    user = game_user_dir(game_dir)
-    if user is None:
-        return []
+def _enabled_mod_files(user: Path) -> list[Path]:
+    """`dlc_load.json` 里启用的那些 `.mod`（按启用顺序，后加载的排后面）。"""
     load = user / "dlc_load.json"
-    enabled: list[str] = []
+    rels: list[str] = []
     if load.is_file():
         try:
             raw = json.loads(load.read_text(encoding="utf-8-sig"))
-            enabled = [str(x) for x in (raw.get("enabled_mods") or [])]
+            rels = [str(x) for x in (raw.get("enabled_mods") or [])]
         except (OSError, ValueError):
-            enabled = []
-
-    out: list[ModInfo] = []
-    for rel in enabled:
-        mod_file = user / rel.replace("\\", "/")
-        if not mod_file.is_file():
-            # 也可能是绝对路径
+            rels = []
+    out: list[Path] = []
+    for rel in rels:
+        f = user / rel.replace("\\", "/")
+        if not f.is_file():
             alt = Path(rel)
-            mod_file = alt if alt.is_file() else mod_file
-        desc = _parse_mod_descriptor(mod_file) if mod_file.is_file() else {}
-        raw_path = desc.get("path") or ""
-        mpath = Path(raw_path) if raw_path else None
-        if mpath is None or not mpath.is_dir():
-            # 没有 path= 时按惯例找同名的目录
-            guess = mod_file.with_suffix("")
-            mpath = guess if guess.is_dir() else None
-        if mpath is None or not mpath.is_dir():
+            if alt.is_file():
+                f = alt
+        if f.is_file():
+            out.append(f)
+        else:
+            out.append(f)          # 留给调用方报"文件找不到"
+    return out
+
+
+def discover_mods_report(game_dir: Path) -> dict:
+    """启用的 mod + **读不进来的那些及原因**。
+
+    0.11.1 加 `skipped`：以前路径解不出来就 `continue` 静默跳过，
+    用户启用了 5 个 mod、世界只按 4 个建出来，界面上一个字都不说。
+    「差在哪」必须说出来（世界 id 是按 mod 集合算的，少一个就是另一个世界）。
+    """
+    user = game_user_dir(game_dir)
+    if user is None:
+        return {"ok": False, "user_dir": "", "mods": [],
+                "skipped": [{"name": "", "mod_file": "",
+                             "reason": "找不到用户目录（没有 dlc_load.json / mod/）"}]}
+    mods: list[ModInfo] = []
+    skipped: list[dict] = []
+    for f in _enabled_mod_files(user):
+        if not f.is_file():
+            skipped.append({"name": f.stem, "mod_file": str(f),
+                            "reason": "dlc_load.json 里启用了，但这个 .mod 文件不在"})
             continue
+        desc = _parse_mod_descriptor(f)
+        mpath, why = _resolve_mod_dir(desc, f, user)
+        if mpath is None:
+            skipped.append({"name": desc.get("name") or f.stem,
+                            "mod_file": str(f), "reason": why})
+            continue
+        mods.append(ModInfo(
+            name=desc.get("name") or mpath.name,
+            version=desc.get("version") or "",
+            path=mpath, mod_file=f,
+            replace_paths=list(desc.get("replace_path") or []),
+            remote_file_id=str(desc.get("remote_file_id") or ""),
+        ))
+    return {"ok": True, "user_dir": str(user), "mods": mods,
+            "skipped": skipped}
+
+
+def discover_mods(game_dir: Path) -> list[ModInfo]:
+    """按 `dlc_load.json` 里启用的顺序返回 mod 列表（后加载的排在后面）。
+
+    读不进来的那些看 `discover_mods_report()`。
+    """
+    return list(discover_mods_report(game_dir)["mods"])
+
+
+def all_mods(game_dir: Path) -> list[ModInfo]:
+    """用户目录里**所有**能读到的 mod，`enabled` 标出启动器当前启用没有。
+
+    为什么要有这个：`dlc_load.json` 只列**当前启用**的。想给 TFR 单独建一份
+    世界数据，就得先在启动器里把 TFR 打开、建完再关掉——纯粹是折腾。
+    有了全量清单，面板可以让用户直接在插件里勾哪几个 mod 参与建世界。
+    """
+    user = game_user_dir(game_dir)
+    if user is None:
+        return []
+    enabled_files = {f.resolve() for f in _enabled_mod_files(user) if f.is_file()}
+    mod_dir = user / "mod"
+    out: list[ModInfo] = []
+    if not mod_dir.is_dir():
+        return out
+    for f in sorted(mod_dir.glob("*.mod")):
+        desc = _parse_mod_descriptor(f)
+        mpath, _why = _resolve_mod_dir(desc, f, user)
+        if mpath is None:
+            continue
+        try:
+            is_on = f.resolve() in enabled_files
+        except OSError:
+            is_on = False
         out.append(ModInfo(
             name=desc.get("name") or mpath.name,
             version=desc.get("version") or "",
-            path=mpath,
-            mod_file=mod_file,
+            path=mpath, mod_file=f,
             replace_paths=list(desc.get("replace_path") or []),
+            enabled=is_on,
+            remote_file_id=str(desc.get("remote_file_id") or ""),
         ))
     return out
+
+
+def mods_by_names(game_dir: Path, names: list[str]) -> tuple[list[ModInfo], list[str]]:
+    """按名字从**全量清单**里挑 mod（给"我要读这几个"用）。返回 (选中的, 没找到的)。"""
+    pool = all_mods(game_dir)
+    by_name = {m.name: m for m in pool}
+    by_stem = {m.mod_file.stem: m for m in pool}
+    picked: list[ModInfo] = []
+    miss: list[str] = []
+    for raw in names:
+        key = str(raw).strip()
+        if not key:
+            continue
+        m = by_name.get(key) or by_stem.get(key)
+        if m is None:
+            low = key.lower()
+            hit = [x for x in pool if low in x.name.lower()
+                   or low in x.mod_file.stem.lower()]
+            m = hit[0] if len(hit) == 1 else None
+        if m is None:
+            miss.append(key)
+            continue
+        m.enabled = True
+        picked.append(m)
+    return picked, miss
 
 
 # ────────────────────────────── 文件视图 ──────────────────────────────

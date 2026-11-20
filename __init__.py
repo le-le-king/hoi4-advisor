@@ -4054,13 +4054,21 @@ class HoI4AdvisorPlugin(NekoPluginBase):
                     "items": {"type": "integer"},
                     "description": "用前几个启用的 mod（1 开始）；不给就是全部",
                 },
+                "mod_names": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "按名字读指定的 mod（从全量清单里挑，不必先在启动器里启用）",
+                },
             },
             "required": ["game_dir"],
             "additionalProperties": False,
         },
     )
-    async def entry_world_build(self, game_dir: str = "", mod_indexes=None, **_):
-        return Ok(await asyncio.to_thread(panel_mod.start_build, _s(game_dir).strip(), mod_indexes))
+    async def entry_world_build(self, game_dir: str = "", mod_indexes=None,
+                                mod_names=None, **_):
+        return Ok(await asyncio.to_thread(
+            panel_mod.start_build, _s(game_dir).strip(), mod_indexes,
+            [str(x) for x in mod_names] if mod_names else None))
 
     _trace("3.9c4 world_progress 装饰前")
     @plugin_entry(

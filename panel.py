@@ -237,9 +237,15 @@ def preview_worlds(game_dir: str, mod_indexes: list[int] | None = None) -> dict:
     except Exception:  # noqa: BLE001
         version = ""
     try:
-        mods = atlas.discover_mods(game)
+        rep = atlas.discover_mods_report(game)
+        mods = list(rep["mods"])
+        skipped = list(rep["skipped"])
     except Exception:  # noqa: BLE001
-        mods = []
+        rep, mods, skipped = {}, [], []
+    try:
+        pool = atlas.all_mods(game)
+    except Exception:  # noqa: BLE001
+        pool = []
 
     options: list[dict] = []
 
@@ -270,7 +276,14 @@ def preview_worlds(game_dir: str, mod_indexes: list[int] | None = None) -> dict:
                 n = int(n)
                 if 1 <= n <= len(mods):
                     _add("前 %d 个 mod" % n, mods[:n])
-    return {"ok": True, "game_dir": str(game), "version": version, "options": options}
+    # 0.11.1：把**全量清单**也交出去，让用户能勾"我要读哪几个"，
+    # 不必先在启动器里打开某个 mod 才能建它的数据。
+    return {"ok": True, "game_dir": str(game), "version": version,
+            "options": options,
+            "user_dir": rep.get("user_dir") or "",
+            "enabled_mods": [m.as_dict() for m in mods],
+            "all_mods": [m.as_dict() for m in pool],
+            "skipped": skipped}
 
 
 # ──────────────────────────── 生成（后台） ────────────────────────────
@@ -298,7 +311,9 @@ def _runner(game_dir: Path, mods: list[atlas.ModInfo], version: str) -> None:
             _BUILD.update({
                 "running": False, "ok": True, "percent": 100.0, "phase": "完成",
                 "world_id": world_id, "finished": time.time(),
-                "warnings": list(meta.get("warnings") or []),
+                "warnings": list(meta.get("warnings") or [])
+                            + [f"没读进来的 mod：{s.get('name')}——{s.get('reason')}"
+                               for s in (_BUILD.get("skipped") or [])],
                 "result": {"id": world_id, "provinces": meta.get("provinces"),
                            "states": meta.get("states"),
                            "countries": meta.get("countries"),
@@ -316,8 +331,14 @@ def _runner(game_dir: Path, mods: list[atlas.ModInfo], version: str) -> None:
             })
 
 
-def start_build(game_dir: str, mod_indexes: list[int] | None = None) -> dict:
-    """开始生成。已经在跑就拒绝，避免两个线程同时抢写。"""
+def start_build(game_dir: str, mod_indexes: list[int] | None = None,
+                mod_names: list[str] | None = None) -> dict:
+    """开始生成。已经在跑就拒绝，避免两个线程同时抢写。
+
+    `mod_names` 是 0.11.1 加的：**按名字从全量清单里挑**，不必先在启动器里
+    把 mod 打开。想给 TFR 单独建一份数据，直接在插件里点它就行。
+    没给 `mod_names` / `mod_indexes` 就按启动器当前启用的那套（旧行为）。
+    """
     with _LOCK:
         if _BUILD.get("running"):
             return {"ok": False, "error": "上一次生成还没结束，等它跑完"}
@@ -336,7 +357,22 @@ def start_build(game_dir: str, mod_indexes: list[int] | None = None) -> dict:
 
     try:
         version = config.game_dir_version(game)
-        mods = atlas.discover_mods(game)
+    except Exception as exc:  # noqa: BLE001
+        with _LOCK:
+            _BUILD.update({"running": False, "ok": False, "phase": "失败",
+                           "error": f"{type(exc).__name__}: {exc}"})
+        return {"ok": False, "error": str(exc)}
+
+    skipped: list[dict] = []
+    try:
+        if mod_names:
+            mods, miss = atlas.mods_by_names(game, list(mod_names))
+            skipped = [{"name": n, "reason": "这个 mod 没找到（名字对不上）"}
+                       for n in miss]
+        else:
+            rep = atlas.discover_mods_report(game)
+            mods = list(rep["mods"])
+            skipped = list(rep["skipped"])
     except Exception as exc:  # noqa: BLE001
         with _LOCK:
             _BUILD.update({"running": False, "ok": False, "phase": "失败",
@@ -344,16 +380,23 @@ def start_build(game_dir: str, mod_indexes: list[int] | None = None) -> dict:
         return {"ok": False, "error": str(exc)}
 
     if mod_indexes is not None:
-        picked: list[atlas.ModInfo] = []
+        picked2: list[atlas.ModInfo] = []
         for n in mod_indexes:
             n = int(n)
             if 1 <= n <= len(mods):
-                picked.append(mods[n - 1])
-        mods = picked
+                picked2.append(mods[n - 1])
+        mods = picked2
+
+    # 读不进来的 mod 一定要说出来：世界 id 是按 mod 集合算的，
+    # 少一个就是另一个世界，界面上一个字不说等于骗人。
+    if skipped:
+        with _LOCK:
+            _BUILD["skipped"] = skipped
 
     threading.Thread(target=_runner, args=(game, mods, version),
                      name="hoi4-atlas-build", daemon=True).start()
-    return {"ok": True, "started": True, "mods": [m.name for m in mods]}
+    return {"ok": True, "started": True, "mods": [m.name for m in mods],
+            "skipped": skipped}
 
 
 # ──────────────────────────── 切换 / 删除 ────────────────────────────
