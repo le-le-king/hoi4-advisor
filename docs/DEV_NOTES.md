@@ -1701,6 +1701,63 @@ cities    2490       map 5632×2048    warnings: 415 个州在汉化里没名字
 **待真机验证**：真实游戏里进攻部队打赢后不会自动前进，要靠 `moves` 跟进；
 这个时序离线验不出来。
 
+## 0.11.3：`replace_path` 的语义要"逐条"验，不能只看数量
+
+世界资料库一直说"按 `replace_path` 合并 mod 层"，但之前只验过**数量**对不对
+（省/州/国名/邻接），没验**规则本身**。这次拿磁盘上真实的 The Fire Rises
+（60 条 `replace_path`）逐条断言。
+
+### HOI4 有两条规则，很容易混成一条
+
+1. **同名文件覆盖**：mod 里有同名文件就用 mod 的，没有就落回原版；
+2. **目录整体替换**：声明了 `replace_path` 的目录，**只**从 mod 取，原版那份整个作废——
+   mod 只放了半个目录也**不回退**。
+
+第 2 条最容易写错。写成"先查 mod、查不到回退原版"，就会把**原版的旧地图/旧州混进
+新 mod 的世界里**，而数量看上去还挺正常。
+
+### 验证结果（`_probe/_p189_replacelayer.py`）
+
+```
+一、被替换目录里的文件必须来自 mod
+  ✓ map/provinces.bmp 来自 mod      ✓ map/definition.csv 来自 mod
+
+二、被替换目录里 mod 缺的文件，不许回退原版
+  ✓ common/abilities/CHI_abilities.txt 原版有、mod 没有 → find() 返回 None
+  ✓   对照：这个文件在原版里确实存在
+
+三、未声明替换的目录：mod 同名覆盖 / 缺失回退原版
+  ✓ localisation/.../JUNO_events_l_simp_chinese.yml 两边都有 → 用 mod 的
+  ✓ localisation/.../JUNO_characters_l_simp_chinese.yml 只有原版有 → 回退原版
+
+四、glob 在替换目录里只列 mod 的
+  ✓ glob(common/abilities) 共 1 个，来自非 mod 层 0 个
+
+五、各数据类别的来源
+  地图 BMP / 省定义 / 州文件 / 国家 TAG / 国名本地化  → 全部来自 mod
+```
+
+`meta.json` 里的 `sources` 记的就是**实际用了哪份文件**（路径 + mtime + size），
+TFR 那份世界显示 `map/definition.csv` 与 `map/provinces.bmp` 都来自 mod 目录。
+
+### 顺手修掉一个不出声的小毛病
+
+进攻线卡在"上一格还在打"时，`offensive` 没有回 `waiting`，工具那边 `meta.waiting`
+**恒为 None** —— 界面上看不出"是在打还是卡死"。现在如实回还在打的是哪几格。
+
+同时补了一套**命令层记账**的离线验证（`_probe/_p190`），六条：
+
+```
+一、设线 + 推第一步：下 3 单，每个出发省只派 2 个（3 个里留 1），pending 记下目标
+二、目标没打下来：不再下新令，返回 waiting=[102,108,114]
+三、判成我方：自动往下走，step 涨到 3
+四、换一个 Commander 实例（模拟插件重载）：线还在，目标 104，9 个师
+五、撤线：stopped；再调用报"没有进攻线"
+```
+
+第四条的测试脚本第一版是错的（第二次 `build()` 把状态文件覆盖了），改完才真验到
+"重载后线还在"。
+
 ## 还没做
 
 - **模型汇报 0.9.6 已收口**：19:09 宿主开着时验出 `session_id` 没对齐

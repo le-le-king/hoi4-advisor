@@ -1038,8 +1038,11 @@ class Commander:
                             f"抽不出人推——要推得往那儿添兵。")
             if fp.get("hold"):
                 bits.append(f"{len(fp['hold'])} 个省既没有当面之敌也没法跟进。")
+            # `waiting` 要如实回：工具那边拿它告诉调用方"在等，不是卡住了"。
+            # 0.11.2 之前这里恒为 None，界面上看不出"是在打还是卡死"。
             return {"active": True, "line": cur, "stalled": True,
-                    "note": "".join(bits)}
+                    "waiting": (sorted(still) if still else None),
+                    "thin": thin, "note": "".join(bits)}
 
         r = self._apply(player_addr, rows, f"进攻线（目标 {target_p}）")
         cur["pending"] = sorted(already)
