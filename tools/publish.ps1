@@ -1,4 +1,4 @@
-# 一键发布到 GitHub（幂等，可以反复跑；网络不稳就多重试几次）
+﻿# 一键发布到 GitHub（幂等，可以反复跑；网络不稳就多重试几次）
 #
 #   pwsh tools/publish.ps1              # 建仓库(如果还没有) + 推送 + 建 Release
 #   pwsh tools/publish.ps1 -SkipRelease # 只推代码
@@ -62,7 +62,7 @@ if (-not $exists) {
 } else {
     Write-Host "仓库已存在"
     if (-not (git remote get-url origin 2>$null)) {
-        git remote add origin "git@github.com:$full.git"
+        git remote add origin "ssh://git@ssh.github.com:443/$full.git"
     }
 }
 
